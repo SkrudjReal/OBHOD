@@ -1,81 +1,155 @@
-<p align="center">
-  <a href="https://t.me/I_execute"><img src="https://img.shields.io/badge/Telegram-@I__execute-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram" /></a>
-</p>
+# OBHOD
 
-### OBHOD
+Telegram bot over MTProto that installs and drives a [free-turn-proxy](https://github.com/hackdiaz-dev/free-turn-proxy) node on one server and hands out a single `freeturn://` link that works on Android and iOS alike.
 
-A Telegram bot for managing [VK TURN proxy](https://github.com/samosvalishe/free-turn-proxy) peers and WireGuard tunnels through a simple chat interface. Built on Telethon, runs as a systemd user service, and handles everything from initial server setup to peer creation, link generation, and remote revocation — all without SSH access to the VPS.
+Everything the user sees is a rich message: headings, tables, details blocks, code blocks, notice banners and big text buttons. Every button is a callback button built from `tg-button` markup with `callback_data`, never a link button. Nothing goes through the Bot API HTTP transport: the bot talks MTProto with `bot_token` + `api_id` + `api_hash`.
 
-The bot wraps [samosvalishe/free-turn-proxy](https://github.com/samosvalishe/free-turn-proxy) server and automates the full lifecycle: WireGuard keypair generation, obfuscation profile provisioning (rtpopus 1-3 like SRTP-WRAP-S), VK Calls API integration for TURN credential sourcing, and shareable link generation for both iOS and Android clients. Each peer gets its own WireGuard config and TURN proxy port, dynamically allocated and managed through shell scripts executed via passwordless sudo.
+## What changed against the previous bot
 
-### Installation
+| Area | Before | Now |
+| --- | --- | --- |
+| Transport | Bot API over HTTPS | MTProto, `default_transport="mtproto"`, `intake="mtproto"` |
+| Interface | plain text with inline keyboards | rich messages, `tg-button` rows, streaming drafts |
+| Links | separate iOS and Android builders | one `freeturn://` payload for both platforms |
+| Servers | multi server with per server state | one server, one admin |
+| Remote control | ad hoc shell snippets in `Storage/VKTurn` | RPC v3 of the upstream `install.sh` |
+| Installer | user mode with sudo juggling | root only service, refuses non root, `--dev` for local tests |
 
-Run the installer on your VPS as root:
+## Layout
 
-```bash
-bash <(curl -s https://raw.githubusercontent.com/i-execute/OBHOD/main/Storage/Installation/Setuper.sh)
+```
+BOT/
+  main.py       entry point, logging, signals
+  app.py        router, admin gate, operations, draft orchestration
+  screens.py    every screen as a rich message
+  flows.py      text input fields, validation, state mutations
+  drafts.py     streaming drafts over messages.setTyping
+  control.py    install.sh RPC v3 client with typed responses
+  sshx.py       asyncssh session, host key pinning, root mode detection
+  links.py      freeturn codec, kcp profile, android core config
+  models.py     dataclasses for settings, probe results, clients
+  validate.py   input validators
+  store.py      state.json with 0600 permissions
+  ui.py         html and button helpers
+Storage/
+  install.sh          vendored upstream installer, byte identical
+  obhod-install.sh    installer for this bot, root only
+  obhod.service       systemd unit template
+tests/          404 tests, mock control plus a real ssh integration suite
+requirements.txt
+run.sh          local foreground runner
+pytest.ini
 ```
 
-The installer will:
-- Install WireGuard and all dependencies
-- Create a dedicated `OBHOD` system user with lingering enabled
-- Clone the repository and set up a Python venv
-- Configure sudoers for passwordless script execution
-- Ask you for a bot token (get one from [@BotFather](https://t.me/BotFather))
-- Ask for your Telegram user ID (the bot will tell you it after you message it)
-- Start the bot as a systemd user service
+## Requirements
 
-After setup, everything is managed through the Telegram chat with the bot — no SSH needed.
+* Python 3.13 or newer with the `venv` module.
+* Root on the machine that runs the bot, for the unit, the config and the state directory.
+* SSH access to the target server, key or password. Root mode, passwordless sudo and sudo with password are detected automatically.
+* Outbound network from the bot host to Telegram MTProto endpoints and to the target server.
 
-Continue installation in telegram:
+## Install
 
-- Firstly enable inline mode via [@BotFather](https://t.me/BotFather)-> /setinline -> @your_bot
-- Then bot ask you for API ID and API Hash (get them from [my.telegram.org](https://my.telegram.org))
-
-### ⚠️ Warning 
-
-If you have issues when creating application on [my.telegram.org](https://my.telegram.org) like ERROR: error - just run that as root after SSH installation:
-
-```bash
-python3 /home/OBHOD/OBHOD/Storage/Installation/APICerds.py
 ```
-Also you can use resident proxy instead that.
-
-### Abilities
-
-**VKTurn**
-The core VPN module. Creates WireGuard peers and generates connection links for iOS and Android clients. For iOS, it produces a `vkturnproxy://import?data=...` link with the full connection payload (peer keys, obfuscation profile, server address, WRAP key) encoded as base64url JSON. For Android, it produces a `freeturn://` link that embeds the WireGuard config, obfuscation settings, and client ID directly in the URI — no separate WireGuard app import needed. The client ID is registered into the server's `clients.json` allowlist so the freeturn client can authenticate. VK Calls API is used to source TURN relay credentials: the bot starts a VK call via the API, captures the join link, and embeds it into the connection configuration. Users pick an obfuscation profile (`rtpopus`, `rtpopus2`, `rtpopus3`), select a platform, tag the peer, and receive the link. Peers can be listed and revoked at any time — revocation removes both the WireGuard peer and the freeturn client entry from the allowlist.
-
-**Updater**
-Self-update module for the TURN proxy server binary. Fetches releases from the [free-turn-proxy](https://github.com/samosvalishe/free-turn-proxy) GitHub repo, downloads the matching architecture asset (`server-linux-amd64` or `server-linux-arm64`), and swaps the binary in-place via a root script. Requires a GitHub token (entered through inline mode) for API rate limits. The module also supports version tracking through a marker file so the bot knows which release is currently deployed.
-
-### Clients
-
-| Platform | Client | Link |
-|----------|--------|------|
-| iOS | VK TURN Proxy for iOS | [anton48/vk-turn-proxy-ios](https://github.com/anton48/vk-turn-proxy-ios) |
-| Android | FreeTurn Proxy for Android | [samosvalishe/turn-proxy-android](https://github.com/samosvalishe/turn-proxy-android) |
-
-Both clients accept the connection links generated by the bot and handle the rest automatically — WireGuard tunnel setup, TURN relay connection, and traffic obfuscation through the selected WRAP profile.
-
-### Requirements
-
-- Ubuntu 22.04+ (or any Debian-based Linux with `apt`)
-- Root access for initial setup
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- Your Telegram API ID and Hash from [my.telegram.org](https://my.telegram.org)
-- A VK account for TURN credential sourcing (the bot will guide you through OAuth)
-
-### Contributing
-
-PULL REQUESTS ARE WELCOME.
-
-### Credits
-
-- Built with [Telethon](https://codeberg.org/Lonami/Telethon)
-
-### ⚠️ If everything goes wrong:
-
-```bash
-pkill -9 -u OBHOD 2>/dev/null; loginctl terminate-user OBHOD 2>/dev/null; sleep 1; pkill -9 -u OBHOD 2>/dev/null; systemctl disable --now $(systemctl list-units --all --plain --no-legend 'vk-turn-proxy-*' obhod.service | awk '{print $1}') 2>/dev/null; wg-quick down wg0 2>/dev/null; systemctl disable --now wg-quick@wg0 2>/dev/null; iptables -t nat -D POSTROUTING -s 192.168.102.0/24 -j MASQUERADE 2>/dev/null; iptables -D FORWARD -i wg0 -j ACCEPT 2>/dev/null; iptables -D FORWARD -o wg0 -j ACCEPT 2>/dev/null; rm -rf /etc/wireguard /opt/vkturn /etc/sudoers.d/vkturn /etc/sysctl.d/99-wg-forward.conf /etc/systemd/system/vk-turn-proxy-*.service; userdel -rf OBHOD; systemctl daemon-reload
+sudo bash Storage/obhod-install.sh install
 ```
+
+The installer asks for the bot token, `api_id`, `api_hash` and the admin id, copies the payload to `/opt/obhod`, builds the virtual environment, writes `/etc/obhod/obhod.env` with mode 600 and starts `obhod.service`.
+
+Started as a normal user it stops immediately and prints the command to run with `sudo`. Nothing is written in that case.
+
+```
+bash Storage/obhod-install.sh install
+bash Storage/obhod-install.sh update
+bash Storage/obhod-install.sh status
+bash Storage/obhod-install.sh restart
+bash Storage/obhod-install.sh logs
+bash Storage/obhod-install.sh uninstall
+```
+
+Options: `--yes` accepts values already present in the env file, `--prefix=PATH`, `--env-file=PATH`, `--python=PATH`, `--skip-deps` copies the payload without building a virtual environment, and `--dev` installs under `$HOME/.obhod` without root for local testing only.
+
+## Configuration
+
+`/etc/obhod/obhod.env`:
+
+```
+BOT_TOKEN=123456:ABCDEF
+API_ID=12345678
+API_HASH=0123456789abcdef0123456789abcdef
+ADMIN_ID=123456789
+OBHOD_STATE_DIR=/var/lib/obhod
+OBHOD_INSTALL_SCRIPT=/opt/obhod/Storage/install.sh
+OBHOD_LOG_LEVEL=INFO
+```
+
+Optional keys: `OBHOD_SESSION`, `OBHOD_CONNECT_TIMEOUT`, `OBHOD_COMMAND_TIMEOUT`, `OBHOD_APPLY_TIMEOUT`, `OBHOD_DC_HOST`, `OBHOD_DC_PORT`. The same keys are read from the environment, and `OBHOD_ENV` points the bot at a different env file.
+
+`ADMIN_ID` may be left empty. In that case the first account that writes to the bot becomes the admin and the id is stored in `state.json`; every later account is refused. When `ADMIN_ID` is set it always wins.
+
+Only the admin is served. Messages and callbacks from anyone else get a short refusal, no state is read and no remote command runs.
+
+## Screens
+
+* Home: connection state, server address, admin state, entry points to every section.
+* Server: full probe result, apply, stop, restart, links to logs, SSH settings, install parameters, maintenance.
+* SSH: host, port, user, auth mode, password, private key, key passphrase, sudo password, host key pinning reset.
+* Install parameters: backend `new` or `external`, method `docker` or `systemd`, listen port, wireguard port and subnet, external vpn address, mode `udp` or `tcp`, obfuscation profile, obfuscation key, core version, public host for the link.
+* Obfuscation: `rtpopus3`, `rtpopus2`, `rtpopus`, `none`, plus key generation.
+* Clients: allowlist with peer addresses and handshake flags, per client screen with link building, WireGuard config, core config snapshot and two step removal.
+* Connection parameters: threads, streams per credential, transport, tunnel mode, bond, timing, local listen address, DNS mode and servers, manual captcha, call link.
+* Logs: tail selector 50, 200, 500.
+* Maintenance: core update, restart, uninstall with a confirmation screen.
+* Help and link import: offline `freeturn://` parsing with a field by field summary.
+
+Long operations run inside a draft: the bot sends `messages.setTyping` with a rich draft action, keeps it updated while SSH work proceeds, then stops the draft and posts the final screen in place of the pressed message.
+
+## Remote protocol
+
+The bot never calls docker or systemd on the server directly. It pipes the vendored `install.sh` into `bash -s -- <command>` over SSH and reads the last JSON line of the output:
+
+```
+{"proto":3,"result":"ok","data":{...},"logs":[...]}
+```
+
+Commands used: `probe`, `apply`, `stop`, `restart`, `logs`, `client-list`, `client-add`, `client-conf`, `client-remove`, `uninstall`.
+
+Root runs the command as is, passwordless sudo prefixes `sudo -n`, sudo with password prefixes `sudo -k -S -p ''` and sends the password as the first stdin line ahead of the script body. Any protocol version other than 3 is reported as `proto_mismatch` instead of being misinterpreted.
+
+Defaults follow the upstream core: entry port 56000, wireguard subnet `10.13.13.0/24`, wireguard port 51820, mtu 1280, client side `127.0.0.1:9000`, kcp profile with nodelay 1, interval 20, resend 2, nc 1, windows 512, mtu 1200, acknodelay, obfuscation key of 64 hex characters.
+
+## Links
+
+`freeturn://` plus base64url of a compact JSON body:
+
+```
+{"v":1,"provider":"vk","peer":"host:56000","obf":"rtpopus3","key":"...","timing":0,
+ "n":12,"spc":12,"cid":"client-id","name":"owner","listen":"127.0.0.1:9000",
+ "dns":"plain","dnss":"1.1.1.1","mcap":false,"vk":"call link","wg":"[Interface]..."}
+```
+
+There is no platform field and no separate iOS variant. The same payload feeds the Android core configuration view on the client screen, which mirrors the shape the mobile client expects when it starts.
+
+## Tests
+
+```
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt pytest pytest-asyncio pyflakes
+.venv/bin/python -m pytest
+```
+
+404 tests covering validators, the link codec, kcp clamping, RPC parsing, argument quoting, store permissions, every screen, every callback route, the admin gate and admin claim, apply, stop, restart, logs, client add and remove flows, drafts, installer refusal and payload copy, plus a real SSH suite that starts a local asyncssh server, executes the vendored `install.sh` for real and checks the parsed result.
+
+`tests/test_source.py` enforces the source rules: no comments, no docstrings, no emoji, no long dashes, no left over markers in the code written for this bot. `Storage/install.sh` is exempt because it is the vendored upstream installer and is kept byte identical on purpose.
+
+## Security notes
+
+* `state.json` lives in `OBHOD_STATE_DIR` with mode 600, the directory is 700, writes are atomic through a temporary file and `os.replace`.
+* Passwords and keys only travel to the target server over SSH, they are never rendered in a message; the screens show a masked length instead.
+* A password or key typed into the chat is confirmed by a notice that does not repeat the value; the bot deletes nothing on the Telegram side, so secrets typed into a chat stay in that chat history.
+* Host keys are pinned on first successful connection, a change is refused with an explicit error and can be reset from the SSH screen.
+* The unit runs with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome` and a single writable state directory.
+
+## Removed in this rewrite
+
+The old `BOT/Modules`, `BOT/protection.py`, `BOT/strings.py`, `Storage/VKTurn` and `Storage/Installation` trees are gone. Their behaviour is covered by the vendored upstream `install.sh`, which is the only supported way to prepare a server, and by `BOT/control.py`, which drives it over the RPC interface. The legacy bare map `clients.json` layout and the removed `-wrap` flags are not used anywhere.
