@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 
+from . import bootstrap
 from .app import Bot
 from .config import Config, ConfigError
 
@@ -62,6 +63,8 @@ async def amain() -> int:
 
 def main() -> int:
     os.umask(0o077)
+    if sys.argv[1:2] == ["bootstrap"]:
+        return bootstrap.run(sys.argv[2:])
     try:
         return asyncio.run(amain())
     except KeyboardInterrupt:

@@ -87,7 +87,7 @@ class SshClient:
             full = "exec 2>&1\n" + command
             limit = float(timeout or self.command_timeout)
             try:
-                result = await conn.run(full, input=stdin, check=False, encoding=None, timeout=limit)
+                result = await conn.run(full, input=stdin if stdin is not None else b"", check=False, encoding=None, timeout=limit)
             except asyncio.TimeoutError:
                 raise SshError(f"команда не завершилась за {int(limit)} секунд") from None
             except asyncssh.Error as exc:

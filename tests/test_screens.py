@@ -198,3 +198,67 @@ def test_prompt_shows_hint_and_error() -> None:
 
 def test_denied_has_no_buttons() -> None:
     assert count_buttons(screens.denied().build()) == 0
+
+
+def test_setup_has_pinned_version_buttons() -> None:
+    html = screens.setup(full_view()).build()
+    assert 'data="setup:ver:v4.1.0"' in html
+    assert 'data="setup:ver:latest"' in html
+    assert "Своя версия" in html
+
+
+def test_setup_mentions_pinned_policy() -> None:
+    html = screens.setup(full_view()).build()
+    assert "версия ядра закреплена" in html
+
+
+def test_confirm_reset_lists_destructive_steps() -> None:
+    html = screens.confirm_reset(full_view()).build()
+    assert "переустановка с нуля" in html
+    assert "контейнер" in html
+    assert "ft-wg0" in html
+    assert "процессы" in html
+    assert "/opt/free-turn-proxy" in html
+    assert 'data="maint:reset2"' in html
+    assert "перестанут работать" in html
+
+
+def test_confirm_reset_has_single_danger_action() -> None:
+    html = screens.confirm_reset(full_view()).build()
+    buttons = BUTTON_RE.findall(html)
+    danger = [body for attrs, body in buttons if 'style="danger"' in attrs]
+    assert danger == ["Удалить все и поставить заново"]
+
+
+def test_maintenance_offers_reset() -> None:
+    html = screens.maintenance(full_view()).build()
+    assert 'data="maint:reset"' in html
+    assert "Переустановить с нуля" in html
+
+
+def test_server_screen_offers_reset_and_uninstall() -> None:
+    html = screens.server(full_view()).build()
+    assert 'data="srv:reset"' in html
+    assert 'data="srv:uninstall"' in html
+    assert 'data="maint:uninstall2"' not in html
+
+
+def test_uninstall_confirmation_follows_the_entry_point() -> None:
+    assert 'data="maint:uninstall2"' in screens.confirm_uninstall(full_view()).build()
+    assert 'data="srv:uninstall2"' in screens.confirm_uninstall(full_view(), "srv:uninstall2").build()
+
+
+def test_every_screen_stays_within_button_budget() -> None:
+    view = full_view()
+    for rich in (
+        screens.home(view),
+        screens.server(view),
+        screens.setup(view),
+        screens.maintenance(view),
+        screens.clients(view),
+        screens.link_settings(view),
+        screens.help_screen(view),
+        screens.confirm_reset(view),
+        screens.confirm_uninstall(view),
+    ):
+        assert count_buttons(rich.build()) <= 18

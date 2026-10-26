@@ -14,16 +14,18 @@ DEV=0
 CMD=""
 ASSUME_YES=0
 SKIP_DEPS=0
+PURGE_ALL=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    install|uninstall|status|restart|stop|start|logs|update) CMD="$1" ;;
+    install|uninstall|status|restart|stop|start|logs|update|reinstall) CMD="$1" ;;
     --dev) DEV=1 ;;
     --yes|-y) ASSUME_YES=1 ;;
     --prefix=*) PREFIX="${1#*=}" ;;
     --env-file=*) ENV_FILE="${1#*=}"; CONF_DIR="$(dirname -- "$ENV_FILE")" ;;
     --python=*) PYTHON_BIN="${1#*=}" ;;
     --skip-deps) SKIP_DEPS=1 ;;
+    --purge-all) PURGE_ALL=1 ;;
     --help|-h) CMD="help" ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -218,6 +220,50 @@ cmd_uninstall() {
   say "kept $ENV_FILE and $STATE_DIR, delete them manually to forget credentials"
 }
 
+kill_leftovers() {
+  local pid
+  if command -v pgrep >/dev/null 2>&1; then
+    for pid in $(pgrep -f "$PREFIX/venv/bin/python" 2>/dev/null || true); do
+      [ "$pid" = "$$" ] && continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 1
+    for pid in $(pgrep -f "$PREFIX/BOT" 2>/dev/null || true); do
+      [ "$pid" = "$$" ] && continue
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+    say "leftover processes stopped"
+  fi
+}
+
+purge_install() {
+  if [ -n "$SERVICE" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl stop obhod.service >/dev/null 2>&1 || true
+    systemctl disable obhod.service >/dev/null 2>&1 || true
+    rm -f "$SERVICE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed obhod.service >/dev/null 2>&1 || true
+    say "unit removed"
+  fi
+  kill_leftovers
+  rm -rf "$PREFIX"
+  say "removed $PREFIX"
+  if [ "$PURGE_ALL" = "1" ]; then
+    rm -rf "$STATE_DIR"
+    rm -f "$ENV_FILE"
+    say "removed $ENV_FILE and $STATE_DIR"
+  fi
+}
+
+cmd_reinstall() {
+  if [ "$DEV" = "0" ]; then
+    require_root
+  fi
+  say "reinstalling from scratch"
+  purge_install
+  cmd_install
+}
+
 cmd_status() {
   if [ -n "$SERVICE" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl --no-pager --full status obhod.service || true
@@ -259,6 +305,7 @@ usage: bash $0 [command] [options]
 commands:
   install     install the bot, create the config and the systemd unit (default)
   update      copy the payload again and reinstall dependencies
+  reinstall   delete the payload, the unit and the running processes, then install again
   uninstall   remove the payload and the unit
   status      show unit state and file locations
   start       start the unit
@@ -273,6 +320,7 @@ options:
   --env-file=PATH   config file, default /etc/obhod/obhod.env
   --python=PATH     interpreter used to create the venv, default python3
   --skip-deps       copy the payload only, do not build the virtual environment
+  --purge-all       with reinstall: also delete the config file and the state directory
 
 the installer refuses to run as a normal user unless --dev is given.
 EOF
@@ -295,6 +343,7 @@ case "$CMD" in
   install) cmd_install ;;
   update) cmd_update ;;
   uninstall) cmd_uninstall ;;
+  reinstall) cmd_reinstall ;;
   status) cmd_status ;;
   start) cmd_service start ;;
   stop) cmd_service stop ;;

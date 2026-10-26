@@ -519,3 +519,95 @@ async def test_admin_id_zero_allows_until_claimed(tmp_path: Path) -> None:
     assert bot.admin_id == 15
     html = await say(bot, app, "/help", who=16)
     assert "Доступ закрыт" in html
+
+
+async def test_reset_needs_confirmation(tmp_path: Path) -> None:
+    bot, app, control = make_bot(tmp_path)
+    arm(bot)
+    html = await press(bot, app, "maint:reset")
+    assert "переустановка с нуля" in html
+    assert "hard_reset" not in names(control)
+
+
+async def test_reset_from_maintenance_runs_full_wipe(tmp_path: Path) -> None:
+    bot, app, control = make_bot(tmp_path)
+    arm(bot)
+    html = await press(bot, app, "maint:reset2")
+    assert "hard_reset" in names(control)
+    assert ("apply", True) in control.calls
+    assert "заново" in html
+    assert control.reset_progress[0] == "удаление установки через install.sh"
+    assert "каталог установки удален" in control.reset_progress
+    assert any(item[0] == "clients" for item in control.calls)
+
+
+async def test_reset_from_server_screen(tmp_path: Path) -> None:
+    bot, app, control = make_bot(tmp_path)
+    arm(bot)
+    html = await press(bot, app, "srv:reset")
+    assert 'data="maint:reset2"' in html
+    await press(bot, app, "srv:reset2")
+    assert "hard_reset" in names(control)
+
+
+async def test_reset_uses_pinned_version_by_default(tmp_path: Path) -> None:
+    bot, app, control = make_bot(tmp_path)
+    arm(bot)
+    await press(bot, app, "maint:reset2")
+    assert ("hard_reset", "v4.1.0") in control.calls
+
+
+async def test_reset_after_choosing_latest(tmp_path: Path) -> None:
+    bot, app, control = make_bot(tmp_path)
+    arm(bot)
+    await press(bot, app, "setup:ver:latest")
+    assert bot.state.opts.version == "latest"
+    await press(bot, app, "maint:reset2")
+    assert ("hard_reset", "latest") in control.calls
+
+
+async def test_setup_version_button_pins_back(tmp_path: Path) -> None:
+    bot, app, _ = make_bot(tmp_path)
+    await press(bot, app, "setup:ver:latest")
+    html = await press(bot, app, "setup:ver:v4.1.0")
+    assert bot.state.opts.version == "v4.1.0"
+    assert 'data="setup:ver:v4.1.0"' in html
+
+
+async def test_reset_without_ssh_reports_error(tmp_path: Path) -> None:
+    bot, app, control = make_bot(tmp_path)
+    html = await press(bot, app, "maint:reset2")
+    assert "Доступ по SSH" in html or "ssh" in html.lower()
+    assert "hard_reset" not in names(control)
+
+
+async def test_reset_failure_is_rendered(tmp_path: Path) -> None:
+    bot, app, control = make_bot(tmp_path)
+    arm(bot)
+    control.fail = ("hard_reset", "остатки установки не удалены")
+    html = await press(bot, app, "maint:reset2")
+    assert "остатки установки не удалены" in html
+    assert bot.busy is False
+
+
+async def test_reset_clears_busy_flag_on_success(tmp_path: Path) -> None:
+    bot, app, _ = make_bot(tmp_path)
+    arm(bot)
+    await press(bot, app, "maint:reset2")
+    assert bot.busy is False
+
+
+async def test_reset_writes_draft_progress(tmp_path: Path) -> None:
+    bot, app, _ = make_bot(tmp_path)
+    arm(bot)
+    await press(bot, app, "maint:reset2")
+    drafts = [item for item in app.mt.drafts if item["act"] == "messages.setTyping"]
+    payloads = []
+    for item in drafts:
+        action = item.get("action") or {}
+        rich = action.get("rich_message") or {}
+        payloads.append(rich.get("html", ""))
+    joined = "".join(payloads)
+    assert "Выполняется" in joined
+    assert "очистка процессов, интерфейсов и файлов" in joined
+    assert any(action.get("_") == "sendMessageStopDraftAction" for action in [item.get("action") or {} for item in app.mt.drafts])

@@ -8,6 +8,8 @@ from .links import core_config, normalize_conf, wg_summary
 from .models import (
     AUTH_KEY,
     BACKEND_NEW,
+    CORE_VERSION,
+    CORE_VERSION_LATEST,
     OBF_PROFILES,
     ClientInfo,
     ProbeResult,
@@ -96,6 +98,7 @@ def home(view: View) -> Rich:
     blocks.extend(banner(view))
     buttons = [
         big("Сервер", "nav:server", "primary"),
+        big("Xray", "nav:xray"),
         big("Клиенты", "nav:clients"),
         row(button("Ссылки", "nav:link"), button("Журнал", "nav:logs")),
         row(button("Параметры установки", "nav:setup"), button("SSH", "nav:ssh")),
@@ -143,6 +146,7 @@ def server(view: View) -> Rich:
         big("Проверить связь и состояние", "srv:check", "primary"),
         big(apply_label, "srv:apply", "success"),
         row(button("Остановить", "srv:stop"), button("Перезапустить", "srv:restart")),
+        row(button("Переустановить с нуля", "srv:reset", "danger"), button("Удалить установку", "srv:uninstall", "danger")),
         row(button("Параметры установки", "nav:setup"), button("SSH", "nav:ssh")),
         row(button("Журнал", "nav:logs"), button("Обслуживание", "nav:maint")),
         back_row(),
@@ -199,6 +203,7 @@ def setup(view: View) -> Rich:
     blocks = [
         table(rows),
         quote(muted("свой wireguard поднимается на сервере, внешний vpn уже работает вне бота")),
+        quote(muted("версия ядра закреплена: " + CORE_VERSION + " ставится по умолчанию, latest только по выбору")),
     ]
     if opts.backend == BACKEND_NEW and opts.mode != "udp":
         blocks.append(quote(bold("свой wireguard работает только в режиме udp")))
@@ -210,7 +215,11 @@ def setup(view: View) -> Rich:
         row(button("Порт входа", "setup:edit:setup_listen"), button("Порт wg", "setup:edit:setup_wgport")),
         row(button("Подсеть wg", "setup:edit:setup_wgnet"), button("Адрес vpn", "setup:edit:setup_connect")),
         row(button("Обфускация", "setup:obf:menu"), button("Адрес в ссылке", "setup:edit:setup_host")),
-        row(button("Версия", "setup:edit:setup_version"), button("Сгенерировать ключ", "setup:genkey")),
+        row(
+            button("Версия " + CORE_VERSION, "setup:ver:" + CORE_VERSION),
+            button("Версия " + CORE_VERSION_LATEST, "setup:ver:" + CORE_VERSION_LATEST),
+        ),
+        row(button("Своя версия", "setup:edit:setup_version"), button("Сгенерировать ключ", "setup:genkey")),
         back_row(),
     ]
     return screen("Параметры установки", "те же поля, что в мобильном клиенте", blocks, buttons)
@@ -308,7 +317,38 @@ def confirm_remove(view: View, name: str) -> Rich:
     return screen("Подтверждение", "удаляем " + name, blocks, buttons)
 
 
-def confirm_uninstall(view: View) -> Rich:
+def confirm_reset(view: View) -> Rich:
+    opts = view.state.opts
+    blocks = [
+        bold("переустановка с нуля"),
+        bullet_list(
+            [
+                "останавливается и удаляется контейнер и systemd юнит",
+                "удаляется интерфейс ft-wg0 со всеми пирами",
+                "завершаются процессы ядра",
+                "удаляется каталог /opt/free-turn-proxy целиком",
+                "ядро скачивается заново и ставится пустым",
+            ]
+        ),
+        table(
+            [
+                ("версия ядра", code(opts.version)),
+                ("метод", code(opts.method)),
+                ("backend", code(opts.backend)),
+                ("порт входа", code(opts.listen_port)),
+            ]
+        ),
+        quote(muted("существующие клиентские пиры и ссылки перестанут работать")),
+    ]
+    blocks.extend(banner(view))
+    buttons = [
+        big("Удалить все и поставить заново", "maint:reset2", "danger"),
+        row(button("Отмена", "nav:maint"), button("Сервер", "nav:server")),
+    ]
+    return screen("Подтверждение", "сервер очищается полностью", blocks, buttons)
+
+
+def confirm_uninstall(view: View, action: str = "maint:uninstall2") -> Rich:
     blocks = [
         bold("удаление установки"),
         bullet_list(
@@ -322,7 +362,7 @@ def confirm_uninstall(view: View) -> Rich:
     ]
     blocks.extend(banner(view))
     buttons = [
-        row(button("Удалить установку", "maint:uninstall2", "danger"), button("Отмена", "nav:maint")),
+        row(button("Удалить установку", action, "danger"), button("Отмена", "nav:maint")),
     ]
     return screen("Подтверждение", "удаляем сервер целиком", blocks, buttons)
 
@@ -445,7 +485,8 @@ def maintenance(view: View) -> Rich:
         ),
         bullet_list(
             [
-                bold("обновить ядро") + " " + muted("переустановка с текущими параметрами"),
+                bold("обновить ядро") + " " + muted("скачать закрепленную версию и перезапустить сервис"),
+                bold("переустановить с нуля") + " " + muted("снести установку, интерфейсы и процессы, поставить заново"),
                 bold("перезапустить") + " " + muted("мягкий рестарт сервиса"),
                 bold("удалить установку") + " " + muted("полный снос сервера, бот остается"),
             ]
@@ -454,6 +495,7 @@ def maintenance(view: View) -> Rich:
     blocks.extend(banner(view))
     buttons = [
         big("Обновить ядро", "maint:update", "primary"),
+        big("Переустановить с нуля", "maint:reset", "danger"),
         big("Перезапустить", "maint:restart"),
         big("Удалить установку", "maint:uninstall", "danger"),
         back_row(),

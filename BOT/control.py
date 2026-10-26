@@ -8,6 +8,8 @@ from typing import Any
 from .config import Config
 from .links import kcp_args
 from .models import (
+    CORE_VERSION,
+    CORE_VERSION_LATEST,
     ApplyOutcome,
     ClientInfo,
     ProbeResult,
@@ -16,7 +18,7 @@ from .models import (
     ShareInfo,
     SshSettings,
 )
-from .sshx import MODE_SUDO_PASS, SshClient, SshError, wrap_sudo
+from .sshx import MODE_SUDO_PASS, SshClient, SshError, SshOutput, wrap_sudo
 
 PROTO = 3
 
@@ -46,6 +48,50 @@ ERROR_CODES = {
     "sudo_auth_failed": "sudo требует пароль",
     "sudo_requiretty": "sudo требует tty",
     "proto_mismatch": "версия протокола install.sh не совпадает",
+    "unknown": "неизвестная ошибка install.sh",
+}
+
+
+RESET_SCRIPT = """set -u
+PREFIX=/opt/free-turn-proxy
+CONTAINER=free-turn-proxy
+UNIT=free-turn-proxy.service
+UNIT_PATH=/etc/systemd/system/free-turn-proxy.service
+WG_IFACE=ft-wg0
+WG_CONF=/etc/wireguard/ft-wg0.conf
+SYSCTL=/etc/sysctl.d/99-free-turn-proxy.conf
+say() { printf 'reset %s\\n' "$1"; }
+if command -v docker >/dev/null 2>&1 && docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 && say container
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl disable --now "$UNIT" >/dev/null 2>&1 && say unit_stopped
+  rm -f "$UNIT_PATH"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+fi
+rm -f "$UNIT_PATH"
+if command -v wg-quick >/dev/null 2>&1; then
+  wg-quick down "$WG_IFACE" >/dev/null 2>&1 || true
+fi
+if command -v ip >/dev/null 2>&1 && ip link show "$WG_IFACE" >/dev/null 2>&1; then
+  ip link del "$WG_IFACE" >/dev/null 2>&1 && say interface
+fi
+if command -v pkill >/dev/null 2>&1; then
+  pkill -f "$PREFIX" >/dev/null 2>&1 && say processes
+fi
+rm -f "$WG_CONF" "$SYSCTL" /usr/local/bin/freeturn
+rm -rf "$PREFIX"
+say prefix
+printf 'reset done\\n'
+"""
+
+RESET_LABELS = {
+    "container": "контейнер остановлен и удален",
+    "unit_stopped": "сервис остановлен и снят с автозапуска",
+    "interface": "интерфейс ft-wg0 удален",
+    "processes": "процессы ядра завершены",
+    "prefix": "каталог установки удален",
 }
 
 
@@ -54,6 +100,13 @@ class ControlError(Exception):
         super().__init__(message)
         self.message = message
         self.code = code
+
+
+@dataclass
+class ResetOutcome:
+    steps: list[str] = field(default_factory=list)
+    response: ControlResponse | None = None
+    probe: ProbeResult | None = None
 
 
 @dataclass
@@ -150,12 +203,19 @@ class ControlClient:
         self.script = cfg.require_install_script()
         self.ssh = ssh or SshClient(cfg.connect_timeout, cfg.command_timeout)
 
-    def stdin_for(self, cfg: SshSettings) -> bytes:
-        body = self.script.encode("utf-8")
+    def stdin_payload(self, cfg: SshSettings, body: bytes) -> bytes:
         if cfg.mode == MODE_SUDO_PASS:
             password = (cfg.sudo_password or cfg.password or "").encode("utf-8")
             return password + b"\n" + body
         return body
+
+    def stdin_for(self, cfg: SshSettings) -> bytes:
+        return self.stdin_payload(cfg, self.script.encode("utf-8"))
+
+    async def run_script(self, cfg: SshSettings, script: str, timeout: float | None = None) -> SshOutput:
+        command = wrap_sudo("bash -s", cfg.mode)
+        stdin = self.stdin_payload(cfg, script.encode("utf-8"))
+        return await self.ssh.run(cfg, command, stdin=stdin, timeout=timeout or self.cfg.command_timeout)
 
     async def call(self, cfg: SshSettings, argv: list[str], timeout: float | None = None) -> ControlResponse:
         command = wrap_sudo("bash -s -- " + " ".join(shell_quote(item) for item in argv), cfg.mode)
@@ -177,6 +237,18 @@ class ControlClient:
         return ProbeResult.from_dict(response.data)
 
     async def apply(self, cfg: SshSettings, opts: ServerOptions, update: bool = False) -> ControlResponse:
+        try:
+            return await self._apply_once(cfg, opts, update)
+        except ControlError as exc:
+            if exc.code != "download_failed" or opts.version != CORE_VERSION_LATEST:
+                raise
+            opts.version = CORE_VERSION
+            response = await self._apply_once(cfg, opts, update)
+            response.data["fallback"] = True
+            response.data["fallback_version"] = CORE_VERSION
+            return response
+
+    async def _apply_once(self, cfg: SshSettings, opts: ServerOptions, update: bool = False) -> ControlResponse:
         argv = ["apply", *apply_argv(opts)]
         if update:
             argv.append("--update")
@@ -236,6 +308,54 @@ class ControlClient:
         response.raise_for_status()
         return response
 
+    async def purge(self, cfg: SshSettings) -> list[str]:
+        try:
+            await self.uninstall(cfg, target="all", purge=True)
+        except ControlError as exc:
+            if exc.code == "not_installed":
+                return []
+            return [f"удаление через install.sh: {exc.message}"]
+        return ["установка удалена через install.sh"]
+
+    async def sweep(self, cfg: SshSettings) -> list[str]:
+        try:
+            out = await self.run_script(cfg, RESET_SCRIPT, timeout=self.cfg.apply_timeout)
+        except SshError as exc:
+            raise ControlError(f"очистка сервера не выполнена: {exc.message}", "transport") from None
+        steps: list[str] = []
+        for line in out.text.splitlines():
+            token = line.strip()
+            if token.startswith("reset "):
+                name = token.split(" ", 1)[1].strip()
+                if name == "done":
+                    continue
+                steps.append(RESET_LABELS.get(name, name))
+        return steps
+
+    async def hard_reset(
+        self,
+        cfg: SshSettings,
+        opts: ServerOptions,
+        on_step: Any = None,
+    ) -> ResetOutcome:
+        await _note(on_step, "удаление установки через install.sh")
+        steps = await self.purge(cfg)
+        await _note(on_step, "очистка процессов, интерфейсов и файлов")
+        steps.extend(await self.sweep(cfg))
+        for step in steps:
+            await _note(on_step, step)
+        await _note(on_step, "проверка чистоты сервера")
+        state = await self.probe(cfg)
+        if state.installed:
+            raise ControlError("остатки установки не удалены, установка отменена", "internal")
+        await _note(on_step, "установка ядра " + str(opts.version))
+        response = await self.apply(cfg, opts, update=True)
+        await _note(on_step, "проверка состояния после установки")
+        probe = await self.probe(cfg)
+        if not probe.installed:
+            raise ControlError("ядро не установилось после очистки", "start_failed")
+        return ResetOutcome(steps=steps, response=response, probe=probe)
+
     async def uninstall(self, cfg: SshSettings, target: str = "all", purge: bool = True) -> ControlResponse:
         argv = ["uninstall", f"--target={target}"]
         if purge:
@@ -243,6 +363,14 @@ class ControlClient:
         response = await self.call(cfg, argv, timeout=self.cfg.apply_timeout)
         response.raise_for_status()
         return response
+
+
+async def _note(on_step: Any, text: str) -> None:
+    if on_step is None:
+        return
+    result = on_step(text)
+    if hasattr(result, "__await__"):
+        await result
 
 
 def decode_conf(payload: str) -> str:

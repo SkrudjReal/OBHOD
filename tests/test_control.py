@@ -19,7 +19,7 @@ from BOT.control import (
     shell_quote,
 )
 from BOT.links import kcp_args
-from BOT.models import ProbeResult, ServerOptions, SshSettings
+from BOT.models import CORE_VERSION, CORE_VERSION_LATEST, ProbeResult, RemoteConfig, ServerOptions, SshSettings
 from tests.fakes import make_config
 
 
@@ -50,7 +50,7 @@ def test_apply_argv_defaults() -> None:
     assert "--mode=udp" in argv
     assert "--obf-profile=rtpopus3" in argv
     assert f"--obf-key={'a' * 64}" in argv
-    assert "--version=latest" in argv
+    assert "--version=v4.1.0" in argv
     assert not any(item.startswith("--kcp") for item in argv)
 
 
@@ -269,3 +269,118 @@ def test_uninstall_argv(monkeypatch, tmp_path) -> None:
 
     asyncio.run(client.uninstall(SshSettings(), "all", True))
     assert seen == [["uninstall", "--target=all", "--purge"]]
+
+
+def test_apply_argv_pinned_and_latest() -> None:
+    assert "--version=v4.1.0" in apply_argv(ServerOptions(obf_key="a" * 64))
+    assert "--version=latest" in apply_argv(ServerOptions(obf_key="a" * 64, version="latest"))
+
+
+def test_probe_version_is_normalized() -> None:
+    opts = ServerOptions()
+    opts.from_probe(RemoteConfig(version="4.1.0"))
+    assert opts.version == "v4.1.0"
+    opts.from_probe(RemoteConfig(version=""))
+    assert opts.version == "v4.1.0"
+    opts.from_probe(RemoteConfig(version="nonsense"))
+    assert opts.version == "v4.1.0"
+    opts.from_probe(RemoteConfig(version="latest"))
+    assert opts.version == "latest"
+
+
+def test_server_options_from_dict_keeps_pin() -> None:
+    assert ServerOptions.from_dict({}).version == "v4.1.0"
+    assert ServerOptions.from_dict({"version": "4.0.2"}).version == "v4.0.2"
+    assert ServerOptions.from_dict({"version": "latest"}).version == "latest"
+    assert ServerOptions.from_dict({"version": "wat"}).version == "v4.1.0"
+
+
+def test_apply_latest_falls_back_to_pinned(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    client = ControlClient(cfg(tmp_path))
+    seen: list[str] = []
+
+    async def fake_call(cfg_obj, argv, timeout=None):
+        seen.append(" ".join(argv))
+        if len(seen) == 1:
+            return parse_response(
+                json.dumps({"proto": 3, "result": "err", "code": "download_failed", "msg": "нет сети"})
+            )
+        return parse_response(json.dumps({"proto": 3, "result": "ok", "data": {"service": "active"}}))
+
+    monkeypatch.setattr(client, "call", fake_call)
+    opts = ServerOptions(version=CORE_VERSION_LATEST)
+    response = asyncio.run(client.apply(SshSettings(), opts))
+    assert response.data["fallback"] is True
+    assert response.data["fallback_version"] == CORE_VERSION
+    assert len(seen) == 2
+    assert "--version=" + CORE_VERSION in seen[1]
+    assert opts.version == CORE_VERSION
+
+
+def test_apply_latest_without_error_keeps_version(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    client = ControlClient(cfg(tmp_path))
+
+    async def fake_call(cfg_obj, argv, timeout=None):
+        return parse_response(json.dumps({"proto": 3, "result": "ok", "data": {"service": "active"}}))
+
+    monkeypatch.setattr(client, "call", fake_call)
+    opts = ServerOptions(version=CORE_VERSION_LATEST)
+    response = asyncio.run(client.apply(SshSettings(), opts))
+    assert "fallback" not in response.data
+    assert opts.version == CORE_VERSION_LATEST
+
+
+def test_apply_pinned_error_is_not_retried(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    client = ControlClient(cfg(tmp_path))
+    calls: list[int] = []
+
+    async def fake_call(cfg_obj, argv, timeout=None):
+        calls.append(1)
+        return parse_response(
+            json.dumps({"proto": 3, "result": "err", "code": "download_failed", "msg": "нет сети"})
+        )
+
+    monkeypatch.setattr(client, "call", fake_call)
+    with pytest.raises(ControlError):
+        asyncio.run(client.apply(SshSettings(), ServerOptions(version=CORE_VERSION)))
+    assert len(calls) == 1
+
+
+def test_apply_other_error_is_not_retried(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    client = ControlClient(cfg(tmp_path))
+    calls: list[int] = []
+
+    async def fake_call(cfg_obj, argv, timeout=None):
+        calls.append(1)
+        return parse_response(
+            json.dumps({"proto": 3, "result": "err", "code": "start_failed", "msg": "служба не активна"})
+        )
+
+    monkeypatch.setattr(client, "call", fake_call)
+    with pytest.raises(ControlError):
+        asyncio.run(client.apply(SshSettings(), ServerOptions(version=CORE_VERSION_LATEST)))
+    assert len(calls) == 1
+
+
+def test_apply_fallback_second_call_also_fails(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    client = ControlClient(cfg(tmp_path))
+
+    async def fake_call(cfg_obj, argv, timeout=None):
+        return parse_response(
+            json.dumps({"proto": 3, "result": "err", "code": "download_failed", "msg": "нет сети"})
+        )
+
+    monkeypatch.setattr(client, "call", fake_call)
+    with pytest.raises(ControlError) as info:
+        asyncio.run(client.apply(SshSettings(), ServerOptions(version=CORE_VERSION_LATEST)))
+    assert info.value.code == "download_failed"

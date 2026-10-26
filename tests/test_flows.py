@@ -3,7 +3,14 @@ from __future__ import annotations
 import pytest
 
 from BOT.flows import CYCLE_FIELDS, FIELD_TARGETS, FIELDS, Flows
-from BOT.models import AUTH_KEY, AUTH_PASSWORD, BACKEND_EXTERNAL, BACKEND_NEW
+from BOT.models import (
+    AUTH_KEY,
+    AUTH_PASSWORD,
+    BACKEND_EXTERNAL,
+    BACKEND_NEW,
+    CORE_VERSION,
+    CORE_VERSION_LATEST,
+)
 from BOT.store import State
 from BOT.validate import ValidationError
 from tests.fakes import make_state
@@ -259,3 +266,37 @@ def test_validate_server_none_profile_clears_key() -> None:
 def test_backend_constant_usage() -> None:
     st = state()
     assert st.opts.backend == BACKEND_NEW
+
+
+def test_pin_version_defaults_and_pins() -> None:
+    fl = flows()
+    assert fl.pin_version("latest") == "latest"
+    assert fl.pin_version("v4.0.3") == "v4.0.3"
+    assert fl.pin_version("4.0.3") == "v4.0.3"
+    assert fl.pin_version(CORE_VERSION) == CORE_VERSION
+
+
+def test_pin_version_rejects_junk() -> None:
+    fl = flows()
+    for bad in ("", "local", "4.1", "v4", "latest2", "4;rm -rf /"):
+        with pytest.raises(ValidationError):
+            fl.pin_version(bad)
+
+
+def test_set_version_from_button() -> None:
+    fl = flows()
+    st = state()
+    fl.set_version(st, CORE_VERSION_LATEST)
+    assert st.opts.version == CORE_VERSION_LATEST
+    fl.set_version(st, CORE_VERSION)
+    assert st.opts.version == CORE_VERSION
+
+
+def test_default_version_is_pinned() -> None:
+    assert state().opts.version == CORE_VERSION
+
+
+def test_version_field_prompt_matches_policy() -> None:
+    spec = flows().field("setup_version")
+    assert CORE_VERSION in spec.hint
+    assert "latest" in spec.hint

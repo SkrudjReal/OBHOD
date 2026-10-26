@@ -5,7 +5,16 @@ from dataclasses import dataclass
 
 from . import validate
 from .config import ConfigError
-from .models import AUTH_KEY, AUTH_PASSWORD, BACKEND_EXTERNAL, BACKEND_NEW, OBF_PROFILES
+from .models import (
+    AUTH_KEY,
+    AUTH_PASSWORD,
+    BACKEND_EXTERNAL,
+    BACKEND_NEW,
+    CORE_VERSION,
+    CORE_VERSION_LATEST,
+    OBF_PROFILES,
+    normalize_version,
+)
 from .store import State
 from .validate import ValidationError
 
@@ -33,7 +42,7 @@ FIELDS: dict[str, FieldSpec] = {
     "setup_connect": FieldSpec("setup_connect", "Адрес внешнего VPN", "отправьте адрес в формате host:port", "например 127.0.0.1:51820", False),
     "setup_obfkey": FieldSpec("setup_obfkey", "Ключ обфускации", "отправьте 64 hex символа", "пустое значение сгенерирует новый ключ", True),
     "setup_host": FieldSpec("setup_host", "Адрес в ссылке", "отправьте адрес, который попадет в ссылку", "по умолчанию берется адрес ssh, пустое значение вернет его", False),
-    "setup_version": FieldSpec("setup_version", "Версия ядра", "отправьте версию", "latest, local или vX.Y.Z", False),
+    "setup_version": FieldSpec("setup_version", "Версия ядра", "отправьте версию ядра", "по умолчанию " + CORE_VERSION + ", latest берет свежий релиз", False),
     "link_threads": FieldSpec("link_threads", "Потоки", "отправьте число потоков turn", "по умолчанию 12", False),
     "link_spc": FieldSpec("link_spc", "Потоки на креды", "отправьте число потоков на один кеш кредов", "по умолчанию 12", False),
     "link_timing": FieldSpec("link_timing", "Задержка мимикрии", "отправьте задержку в миллисекундах", "0 выключает пейсинг", False),
@@ -137,7 +146,7 @@ class Flows:
             state.opts.host = "" if value in {"-", ""} else validate.host(value)
             return f"адрес в ссылке: {state.opts.host or 'по ssh'}"
         if key == "setup_version":
-            state.opts.version = validate.version(value)
+            state.opts.version = self.pin_version(value)
             return f"версия ядра: {state.opts.version}"
         if key == "link_threads":
             state.link.threads = validate.positive_int(value, 1, 128, "потоки")
@@ -160,6 +169,18 @@ class Flows:
         if key == "client_name":
             return f"имя клиента: {validate.name(value)}"
         raise ConfigError(f"неизвестное поле ввода: {key}")
+
+    def pin_version(self, value: object) -> str:
+        text = str(value or "").strip()
+        if text == CORE_VERSION_LATEST:
+            return CORE_VERSION_LATEST
+        pinned = normalize_version(text)
+        if not pinned or pinned == "local":
+            raise ValidationError("версия: vX.Y.Z или latest")
+        return pinned
+
+    def set_version(self, state: State, value: object) -> None:
+        state.opts.version = self.pin_version(value)
 
     def toggle_ssh_mode(self, state: State) -> None:
         state.ssh.auth = AUTH_KEY if state.ssh.auth == AUTH_PASSWORD else AUTH_PASSWORD

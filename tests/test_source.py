@@ -11,6 +11,7 @@ AUTHORED_PY = sorted(path for path in ROOT.rglob("*.py") if ".venv" not in path.
 AUTHORED_SH = sorted(path for path in ROOT.rglob("*.sh") if "install.sh" != path.name and ".venv" not in path.parts)
 TEXT_FILES = AUTHORED_PY + AUTHORED_SH + [
     ROOT / "README.md",
+    ROOT / "REPORT.md",
     ROOT / "requirements.txt",
     ROOT / "pytest.ini",
     ROOT / "Storage" / "obhod.service",

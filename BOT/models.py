@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
@@ -28,9 +29,25 @@ DEFAULT_LISTEN_PORT = 56000
 DEFAULT_WG_PORT = 51820
 DEFAULT_WG_NET = "10.13.13.0/24"
 DEFAULT_LOCAL_LISTEN = "127.0.0.1:9000"
+CORE_VERSION = "v4.1.0"
+CORE_VERSION_LATEST = "latest"
+VERSION_CHOICES = (CORE_VERSION, CORE_VERSION_LATEST)
 DEFAULT_THREADS = 12
 DEFAULT_STREAMS_PER_CRED = 12
 DEFAULT_MTU = 1280
+
+
+def normalize_version(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text in {"latest", "local"}:
+        return text
+    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?", text):
+        return text
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?", text):
+        return "v" + text
+    return ""
 
 
 @dataclass
@@ -95,7 +112,7 @@ class ServerOptions:
     mode: str = MODE_UDP
     obf_profile: str = "rtpopus3"
     obf_key: str = ""
-    version: str = "latest"
+    version: str = CORE_VERSION
     kcp: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,8 +137,9 @@ class ServerOptions:
             self.obf_profile = remote.obf_profile
         if remote.obf_key:
             self.obf_key = remote.obf_key
-        if remote.version:
-            self.version = remote.version
+        pinned = normalize_version(remote.version)
+        if pinned:
+            self.version = pinned
 
     @staticmethod
     def from_dict(raw: dict[str, Any] | None) -> "ServerOptions":
@@ -137,7 +155,7 @@ class ServerOptions:
             mode=str(data.get("mode", MODE_UDP)),
             obf_profile=str(data.get("obf_profile", "rtpopus3") or "rtpopus3"),
             obf_key=str(data.get("obf_key", "")),
-            version=str(data.get("version", "latest") or "latest"),
+            version=normalize_version(data.get("version")) or CORE_VERSION,
             kcp=dict(data.get("kcp") or {}),
         )
 

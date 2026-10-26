@@ -60,6 +60,16 @@ def link_button(label: str, url: str) -> str:
     return f'<tg-button type="url" url="{esc(url)}">{esc(label)}</tg-button>'
 
 
+def inline_button(label: str, query: str, style: str = "") -> str:
+    attr = f' style="{esc(style)}"' if style else ""
+    return f'<tg-button type="switch_inline_query_current_chat"{attr} query="{esc(query)}">{esc(label)}</tg-button>'
+
+
+def inline_row(label: str, query: str, style: str = "", extra: Iterable[str] = ()) -> str:
+    items = [inline_button(label, query, style)] + [item for item in extra if item]
+    return '<tg-button-row align="left">' + "".join(items) + "</tg-button-row>"
+
+
 def row(*buttons: Button | str, align: str = "left") -> str:
     inner = "".join(item.html() if isinstance(item, Button) else item for item in buttons)
     return f'<tg-button-row align="{esc(align)}">{inner}</tg-button-row>'

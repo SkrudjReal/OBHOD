@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from BOT.config import Config
-from BOT.control import ControlResponse
+from BOT.control import ControlResponse, ResetOutcome
 from BOT.models import ClientInfo, ProbeResult, RemoteConfig, ShareInfo
 from BOT.store import State
 
@@ -125,6 +125,8 @@ class FakeControl:
         self.conf = WG
         self.log_lines = [f"log line {index}" for index in range(30)]
         self.fail: tuple[str, str] | None = None
+        self.reset_steps = ["контейнер остановлен и удален", "каталог установки удален"]
+        self.reset_progress: list[str] = []
 
     def _maybe_fail(self, name: str) -> None:
         if self.fail and self.fail[0] == name:
@@ -202,6 +204,26 @@ class FakeControl:
         self.client_list = [item for item in self.client_list if item.name != name]
         return ControlResponse(result="ok")
 
+    async def hard_reset(self, cfg: Any, opts: Any, on_step: Any = None) -> ResetOutcome:
+        self.calls.append(("hard_reset", opts.version))
+        self._maybe_fail("hard_reset")
+        plan = [
+            "удаление установки через install.sh",
+            "очистка процессов, интерфейсов и файлов",
+            *self.reset_steps,
+            "проверка чистоты сервера",
+            "установка ядра " + str(opts.version),
+            "проверка состояния после установки",
+        ]
+        for text in plan:
+            self.reset_progress.append(text)
+            if on_step is not None:
+                await on_step(text)
+        self.probe_result.installed = True
+        self.probe_result.running = True
+        response = await self.apply(cfg, opts, update=True)
+        return ResetOutcome(steps=list(self.reset_steps), response=response, probe=self.probe_result)
+
     async def uninstall(self, cfg: Any, target: str = "all", purge: bool = True) -> ControlResponse:
         self.calls.append(("uninstall", target))
         self._maybe_fail("uninstall")
@@ -218,3 +240,158 @@ def make_state() -> State:
     state.owner_client_id = "cid-owner"
     state.owner_conf = WG
     return state
+
+
+class FakeXrayControl:
+    def __init__(self) -> None:
+        from BOT.xrayrpc import CoreState, XrayResponse
+
+        self.calls: list[tuple[str, Any]] = []
+        self.state = CoreState(installed=False, pinned="v26.10.21", arch="x86_64", systemd=True, service="absent")
+        self.fail: tuple[str, str] | None = None
+        self.log_lines = [f"xray log {index}" for index in range(40)]
+        self.config_seen = ""
+        self.Response = XrayResponse
+
+    def _maybe_fail(self, name: str) -> None:
+        if self.fail and self.fail[0] == name:
+            from BOT.xrayrpc import XrayError
+
+            raise XrayError(self.fail[1], "start_failed")
+
+    def _report(self, ports: list[int] | None = None) -> Any:
+        from BOT.xrayrpc import CoreState
+
+        values = self.state.to_dict() if hasattr(self.state, "to_dict") else {}
+        values.update(
+            {
+                "installed": self.state.installed,
+                "version": self.state.version,
+                "pinned": self.state.pinned,
+                "core_path": "/usr/local/bin/xray",
+                "config_path": "/usr/local/etc/xray/config.json",
+                "config_exists": self.state.config_exists,
+                "config_digest": self.state.config_digest,
+                "inbounds": self.state.inbounds,
+                "port": (ports or self.state.ports or [0])[0],
+                "ports": ports if ports is not None else self.state.ports,
+                "listening": ports if ports is not None else self.state.listening,
+                "service": self.state.service,
+                "unit": self.state.unit,
+                "systemd": self.state.systemd,
+                "arch": self.state.arch,
+                "asset": "64",
+                "fallback": self.state.fallback,
+                "fallback_version": self.state.fallback_version,
+            }
+        )
+        return CoreState.from_dict(values)
+
+    async def probe(self, cfg: Any) -> Any:
+        self.calls.append(("probe", None))
+        self._maybe_fail("probe")
+        return self._report()
+
+    async def install_core(self, cfg: Any, version: str = "", url: str = "", sha256: str = "", force: bool = False) -> Any:
+        self.calls.append(("install_core", version))
+        self._maybe_fail("install_core")
+        self.state.installed = True
+        self.state.version = version or "26.10.21"
+        response = self.Response(result="ok", logs=["скачивание", "хеш совпал", "ядро установлено"])
+        response.data = {
+            "installed": True,
+            "version": self.state.version,
+            "pinned": "v26.10.21",
+            "core_path": "/usr/local/bin/xray",
+            "config_path": "/usr/local/etc/xray/config.json",
+            "config_exists": self.state.config_exists,
+            "config_digest": "",
+            "inbounds": 0,
+            "port": 0,
+            "ports": [],
+            "listening": [],
+            "service": self.state.service,
+            "unit": True,
+            "systemd": True,
+            "arch": "x86_64",
+            "asset": "64",
+            "fallback": self.state.fallback,
+            "fallback_version": self.state.fallback_version,
+        }
+        return response
+
+    async def apply(self, cfg: Any, config: str, version: str = "", restart: bool = True) -> Any:
+        self.calls.append(("apply", version))
+        self._maybe_fail("apply")
+        self.config_seen = config
+        import json
+
+        body = json.loads(config)
+        ports = [int(item["port"]) for item in body.get("inbounds") or []]
+        self.state.installed = True
+        self.state.version = version or self.state.version or "26.10.21"
+        self.state.config_exists = True
+        self.state.config_digest = "d" * 64
+        self.state.inbounds = len(ports)
+        self.state.ports = ports
+        self.state.listening = list(ports) if restart else []
+        self.state.service = "active" if restart else "inactive"
+        return self._report(ports)
+
+    async def test_config(self, cfg: Any, config: str) -> tuple[bool, str]:
+        self.calls.append(("test_config", None))
+        return True, "Configuration OK"
+
+    async def restart(self, cfg: Any) -> Any:
+        self.calls.append(("restart", None))
+        self._maybe_fail("restart")
+        self.state.service = "active"
+        self.state.listening = list(self.state.ports)
+        return self._report()
+
+    async def stop(self, cfg: Any) -> Any:
+        self.calls.append(("stop", None))
+        self._maybe_fail("stop")
+        self.state.service = "inactive"
+        self.state.listening = []
+        return self._report()
+
+    async def start(self, cfg: Any) -> Any:
+        self.calls.append(("start", None))
+        self.state.service = "active"
+        self.state.listening = list(self.state.ports)
+        return self._report()
+
+    async def logs(self, cfg: Any, tail: int = 120) -> list[str]:
+        self.calls.append(("logs", tail))
+        self._maybe_fail("logs")
+        return self.log_lines[-tail:]
+
+    async def x25519(self, cfg: Any) -> tuple[str, str]:
+        self.calls.append(("x25519", None))
+        self._maybe_fail("x25519")
+        return "remote-private", "remote-public"
+
+    async def uninstall(self, cfg: Any, purge: bool = True) -> Any:
+        self.calls.append(("uninstall", purge))
+        self._maybe_fail("uninstall")
+        self.state.installed = False
+        self.state.config_exists = False
+        self.state.service = "absent"
+        self.state.ports = []
+        self.state.listening = []
+        return self.Response(result="ok", data={"removed": ["unit", "config"]})
+
+
+class FakeInlineEvt:
+    def __init__(self, query: str = "", src: str = "mt", ident: int = 99, from_id: int = 777) -> None:
+        self.query = query
+        self.src = src
+        self.id = ident
+        self.from_id = from_id
+        self.results: list[dict[str, Any]] = []
+        self.failed = False
+
+    async def answer(self, text: str | None = None, alert: bool = False, **kw: Any) -> None:
+        if kw.get("results") is not None:
+            self.results = kw["results"]

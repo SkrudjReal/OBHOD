@@ -7,11 +7,13 @@ from goygram import GoyGram
 
 from . import screens
 from .config import Config, ConfigError
-from .control import ControlClient, ControlError, ControlResponse
+from .control import ControlClient, ControlError, ControlResponse, ResetOutcome
+from . import inline, xscreens
 from .drafts import Draft
 from .flows import Flows
 from .links import LinkError, build_link, link_rows, normalize_conf, parse_link
 from .models import ClientInfo, ProbeResult, ShareInfo
+from .panel import PanelError, XrayPanel
 from .store import State, Store
 from .ui import button, code, muted, quote, row, screen
 from . import validate
@@ -29,6 +31,7 @@ class Bot:
         self.store = Store(cfg.state_dir / "state.json")
         self.state: State = self.store.load()
         self.control = control or ControlClient(cfg)
+        self.xray = XrayPanel(self)
         self.flows = Flows()
         self.app: GoyGram | None = None
         self.probe: ProbeResult | None = None
@@ -72,6 +75,7 @@ class Bot:
         app.on_msg(fn=self.on_message)
         app.on_cb(fn=self.on_callback)
         app.on_cmd("start", "menu", "help", "id")(self.on_command)
+        app.on_inline(fn=self.on_inline)
         self.app = app
         return app
 
@@ -115,14 +119,52 @@ class Bot:
         await self.send(chat_id, screens.denied())
         return False
 
+    async def on_inline(self, evt: object) -> None:
+        query = str(getattr(evt, "query", "") or "")
+        src = str(getattr(evt, "src", "mt") or "mt")
+        who = int(getattr(evt, "from_id", 0) or 0)
+        results: list[dict] = []
+        if self.admin_id == 0 or who == self.admin_id:
+            current = self.input_values()
+            results = inline.results_for(query, src=src, current=current)
+            if not results:
+                results = inline.results_for(inline.PREFIX, src=src, current=current)
+        try:
+            await evt.answer(results=results, cache_time=0)
+        except Exception as exc:
+            log.warning("inline answer failed: %s", exc)
+
+    def input_values(self) -> dict[str, str]:
+        state = self.state
+        values = {
+            "ssh_host": state.ssh.host,
+            "ssh_port": str(state.ssh.port),
+            "ssh_user": state.ssh.user,
+            "xr_log_level": state.xray.log_level,
+            "xr_scan_targets": ", ".join(state.xray.scan_targets),
+            "xr_scan_manual": "",
+        }
+        if state.xray.inbounds:
+            inbound = state.xray.inbounds[0]
+            values["xr_remark"] = inbound.remark
+            values["xr_port"] = str(inbound.port)
+            values["xr_sni"] = inbound.sni
+            values["xr_dest"] = inbound.dest
+        return values
+
     async def on_message(self, evt: object) -> None:
         if not await self.guard(evt):
+            return
+        text = str(getattr(evt, "text", "") or "")
+        parsed = inline.parse_marker(text)
+        if parsed is not None:
+            await self.on_input(evt, *parsed)
             return
         if self.busy:
             await self.toast(evt, "дождитесь завершения операции", alert=True)
             return
         chat_id = int(getattr(evt, "chat_id", 0) or 0)
-        text = str(getattr(evt, "text", "") or "").strip()
+        text = text.strip()
         who = int(getattr(evt, "from_id", 0) or 0)
         if who in self.pending:
             await self.accept_text(chat_id, text)
@@ -157,6 +199,44 @@ class Bot:
             await self.send(chat_id, screens.help_screen(self.view()))
             return
         await self.send(chat_id, screens.home(self.view()))
+
+    async def on_input(self, evt: object, ident: str, ctx: str, value: str) -> None:
+        chat_id = int(getattr(evt, "chat_id", 0) or 0)
+        msg_id = int(getattr(evt, "msg_id", 0) or 0)
+        await self.drop_marker(chat_id, msg_id)
+        if self.busy and ident != inline.CANCEL:
+            await self.toast(evt, "дождитесь завершения операции", alert=True)
+            return
+        try:
+            if ident == inline.CANCEL:
+                await self.xray.apply_input(chat_id, ident, ctx, value)
+                return
+            if ident.startswith("ssh_"):
+                await self.ssh_input(chat_id, ident, value)
+                return
+            await self.xray.apply_input(chat_id, ident, ctx, value)
+        except (PanelError, ValidationError, ConfigError, LinkError) as exc:
+            await self.send(chat_id, screens.error_screen(self.view(), "Ошибка ввода", str(exc)))
+
+    async def drop_marker(self, chat_id: int, msg_id: int) -> None:
+        if not msg_id or self.app is None:
+            return
+        delete = getattr(self.app, "delete_msg", None) or getattr(self.app, "delete", None)
+        if delete is None:
+            return
+        try:
+            await delete(chat_id, msg_id)
+        except Exception as exc:
+            log.debug("marker delete failed: %s", exc)
+
+    async def ssh_input(self, chat_id: int, ident: str, value: str) -> None:
+        try:
+            notice = self.flows.apply_field(self.state, ident, value)
+        except (ValidationError, ConfigError) as exc:
+            await self.send(chat_id, xscreens.input_screen(xscreens.XrayView(state=self.state, core=dict(self.xray.core), error=str(exc)), ident, "", "nav:ssh"))
+            return
+        self.save()
+        await self.send(chat_id, screens.ssh_settings(self.view(notice=notice)))
 
     async def accept_text(self, chat_id: int, text: str) -> None:
         who = self.admin_id
@@ -204,7 +284,7 @@ class Bot:
         self.pending.pop(self.admin_id, None)
         try:
             await self.route(chat_id, msg_id, data)
-        except (ControlError, ValidationError, LinkError, ConfigError) as exc:
+        except (ControlError, ValidationError, LinkError, ConfigError, PanelError) as exc:
             await self.render(chat_id, msg_id, screens.error_screen(self.view(), "Ошибка", str(exc)))
         except Exception as exc:
             log.exception("callback failed: %s", data)
@@ -234,6 +314,9 @@ class Bot:
         if head == "log":
             await self.log_action(chat_id, msg_id, parts)
             return
+        if head == "xr":
+            await self.xray.route(chat_id, msg_id, data)
+            return
         if head == "maint":
             await self.maint_action(chat_id, msg_id, parts)
             return
@@ -261,6 +344,9 @@ class Bot:
         if page == "logs":
             await self.log_action(chat_id, msg_id, ["log", "refresh"])
             return
+        if page == "xray":
+            await self.render(chat_id, msg_id, xscreens.home(self.xray.view()))
+            return
         if page == "maint":
             await self.render(chat_id, msg_id, screens.maintenance(self.view()))
             return
@@ -286,7 +372,16 @@ class Bot:
             await self.do_restart(chat_id, msg_id)
             return
         if action == "uninstall":
-            await self.render(chat_id, msg_id, screens.confirm_uninstall(self.view()))
+            await self.render(chat_id, msg_id, screens.confirm_uninstall(self.view(), "srv:uninstall2"))
+            return
+        if action == "uninstall2":
+            await self.do_uninstall(chat_id, msg_id)
+            return
+        if action == "reset":
+            await self.render(chat_id, msg_id, screens.confirm_reset(self.view()))
+            return
+        if action == "reset2":
+            await self.do_reset(chat_id, msg_id)
             return
         await self.render(chat_id, msg_id, screens.server(self.view()))
 
@@ -320,6 +415,8 @@ class Bot:
             self.flows.set_method(self.state, value)
         elif action == "mode":
             self.flows.set_mode(self.state, value)
+        elif action == "ver":
+            self.flows.set_version(self.state, value)
         elif action == "obf":
             if value == "menu":
                 await self.render(chat_id, msg_id, screens.obf_menu(self.view()))
@@ -405,6 +502,12 @@ class Bot:
             return
         if action == "uninstall2":
             await self.do_uninstall(chat_id, msg_id)
+            return
+        if action == "reset":
+            await self.render(chat_id, msg_id, screens.confirm_reset(self.view()))
+            return
+        if action == "reset2":
+            await self.do_reset(chat_id, msg_id)
             return
         await self.render(chat_id, msg_id, screens.maintenance(self.view()))
 
@@ -584,6 +687,35 @@ class Bot:
             self.clients = []
             self.share = None
             await self.render(chat_id, msg_id, screens.server(self.view(notice="установка удалена")))
+        finally:
+            self.busy = False
+
+    async def do_reset(self, chat_id: int, msg_id: int) -> None:
+        self.require_ssh()
+        opts = self.state.opts
+        self.flows.validate_server(self.state)
+        self.busy = True
+        draft = await self.stage(chat_id, msg_id, "переустановка с нуля")
+        outcome: ResetOutcome | None = None
+        try:
+            try:
+                await self.handshake(draft)
+
+                async def step(text: str) -> None:
+                    await draft.say(text)
+
+                outcome = await self.control.hard_reset(self.state.ssh, opts, on_step=step)
+                if outcome.response is not None:
+                    self.apply_owner(outcome.response)
+                await draft.say("ядро " + opts.version + " установлено заново")
+                self.probe = outcome.probe
+                await draft.say("чтение списка клиентов")
+                self.clients, self.share = await self.control.clients(self.state.ssh)
+                await draft.say("готово")
+            finally:
+                await draft.close()
+            notice = "сервер очищен и установлен заново, версия " + opts.version
+            await self.render(chat_id, msg_id, screens.server(self.view(notice=notice)))
         finally:
             self.busy = False
 

@@ -9,7 +9,7 @@ from pathlib import Path
 import asyncssh
 import pytest
 
-from BOT.control import ControlClient, ControlError, parse_response
+from BOT.control import RESET_SCRIPT, ControlClient, ControlError, parse_response
 from BOT.models import ServerOptions, SshSettings
 from BOT.sshx import MODE_ROOT, MODE_SUDO_NOPASS, MODE_SUDO_PASS, SshClient, SshError, fingerprint_mode, wrap_sudo
 from tests.fakes import make_config
@@ -249,3 +249,31 @@ def test_parse_response_from_real_script(ssh_server, tmp_path) -> None:
     assert not response.ok
     assert response.code == "not_found"
     assert parse_response('{"proto":3,"result":"ok","data":{}}').ok
+
+
+def test_reset_sweep_runs_over_ssh(ssh_server, tmp_path) -> None:
+    ctl = ControlClient(make_config(tmp_path), ssh=SshClient(connect_timeout=10, command_timeout=120))
+    assert ctl.script
+    out = run(ctl.run_script(settings(int(ssh_server["port"])), RESET_SCRIPT, timeout=60))
+    assert "reset done" in out.text
+    assert "syntax error" not in out.text.lower()
+    assert "command not found" not in out.text.lower()
+
+
+def test_reset_sweep_keeps_the_shell_alive(ssh_server) -> None:
+    ssh = SshClient(connect_timeout=10, command_timeout=120)
+    cfg = settings(int(ssh_server["port"]))
+    run(ssh.run(cfg, "bash -s", stdin=RESET_SCRIPT.encode()))
+    assert "alive" in run(ssh.run(cfg, "echo alive")).text
+
+
+def test_reset_sweep_reports_markers(tmp_path) -> None:
+    class Echo:
+        async def run(self, cfg, command, stdin=None, timeout=None):
+            return __import__("BOT.sshx", fromlist=["SshOutput"]).SshOutput(
+                text="reset container\nreset prefix\nreset done\n"
+            )
+
+    ctl = ControlClient(make_config(tmp_path), ssh=Echo())
+    steps = run(ctl.sweep(settings(22)))
+    assert len(steps) == 2

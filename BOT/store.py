@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import LinkSettings, ServerOptions, SshSettings
+from .xray import XrayState
 
 DEFAULT_TAIL = 200
 
@@ -23,6 +24,7 @@ class State:
     log_tail: int = DEFAULT_TAIL
     clients: list[dict[str, Any]] = field(default_factory=list)
     last_probe: dict[str, Any] = field(default_factory=dict)
+    xray: XrayState = field(default_factory=XrayState)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +37,7 @@ class State:
             "log_tail": self.log_tail,
             "clients": self.clients,
             "last_probe": self.last_probe,
+            "xray": self.xray.to_dict(),
         }
 
     @staticmethod
@@ -50,6 +53,7 @@ class State:
             log_tail=int(data.get("log_tail", DEFAULT_TAIL) or DEFAULT_TAIL),
             clients=list(data.get("clients") or []),
             last_probe=dict(data.get("last_probe") or {}),
+            xray=XrayState.from_dict(data.get("xray")),
         )
 
 
