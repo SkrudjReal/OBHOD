@@ -6,6 +6,8 @@ from typing import Iterable
 
 from goygram.rich import Rich
 
+from . import i18n
+
 MAX_BUTTONS = 18
 MAX_CALLBACK = 64
 SEP = " · "
@@ -71,7 +73,13 @@ def inline_row(label: str, query: str, style: str = "", extra: Iterable[str] = (
 
 
 def row(*buttons: Button | str, align: str = "left") -> str:
-    inner = "".join(item.html() if isinstance(item, Button) else item for item in buttons)
+    flat: list[Button | str] = []
+    for item in buttons:
+        if isinstance(item, (list, tuple)):
+            flat.extend(item)
+        else:
+            flat.append(item)
+    inner = "".join(item.html() if isinstance(item, Button) else item for item in flat)
     return f'<tg-button-row align="{esc(align)}">{inner}</tg-button-row>'
 
 
@@ -148,14 +156,14 @@ def screen(
     return root
 
 
-def status_line(connected: bool, running: bool, installed: bool) -> str:
+def status_line(connected: bool, running: bool, installed: bool, lang: str = i18n.DEFAULT_LANGUAGE) -> str:
     if not connected:
-        return chip("not connected")
+        return chip(i18n.t("STATUS_NOT_CONNECTED", lang))
     if not installed:
-        return chip("not installed")
+        return chip(i18n.t("STATUS_NOT_INSTALLED", lang))
     if running:
-        return chip("running")
-    return chip("stopped")
+        return chip(i18n.t("STATUS_RUNNING", lang))
+    return chip(i18n.t("STATUS_STOPPED", lang))
 
 
 def count_buttons(html: str) -> int:

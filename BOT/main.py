@@ -18,7 +18,6 @@ def setup_logging(level: str) -> None:
         stream=sys.stdout,
     )
     logging.getLogger("goygram").setLevel(logging.WARNING)
-    logging.getLogger("asyncssh").setLevel(logging.WARNING)
 
 
 async def amain() -> int:
@@ -56,8 +55,8 @@ async def amain() -> int:
     if bot.app is not None:
         try:
             await bot.app.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("the session did not close cleanly: %s", type(exc).__name__)
     return 0
 
 

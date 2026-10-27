@@ -78,27 +78,3 @@ def test_env_overrides_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 def test_missing_file_is_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         Config.load(tmp_path / "absent.env")
-
-
-def test_require_install_script(tmp_path: Path) -> None:
-    broken = Config(
-        bot_token="1:A",
-        api_id=1,
-        api_hash=HASH,
-        admin_id=1,
-        state_dir=tmp_path,
-        install_script=tmp_path / "absent.sh",
-    )
-    with pytest.raises(ConfigError):
-        broken.require_install_script()
-    cfg = Config(
-        bot_token="1:A",
-        api_id=1,
-        api_hash=HASH,
-        admin_id=1,
-        state_dir=tmp_path,
-        install_script=Path(__file__).resolve().parent.parent / "Storage" / "install.sh",
-    )
-    body = cfg.require_install_script()
-    assert "proto" in body or "free-turn" in body
-    assert body.count("\n") > 100

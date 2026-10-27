@@ -1,283 +1,224 @@
 # OBHOD
 
-Telegram bot over MTProto that installs and drives a [free-turn-proxy](https://github.com/hackdiaz-dev/free-turn-proxy) node on one server and hands out a single `freeturn://` link that works on Android and iOS alike.
+Telegram bot over MTProto that manages the Xray server it runs on and hands out post quantum VLESS subscriptions.
+It never talks to another machine over SSH: the management channel is pinned to loopback.
 
-Everything the user sees is a rich message: headings, tables, details blocks, code blocks, notice banners and big text buttons. Every button is a callback button built from `tg-button` markup with `callback_data`, never a link button. Nothing goes through the Bot API HTTP transport: the bot talks MTProto with `bot_token` + `api_id` + `api_hash`.
+The whole product is post quantum: the client and the server agree on `X25519MLKEM768` inside the VLESS handshake
+(`mlkem768x25519plus`), and REALITY can add an `ML-DSA-65` signature (`mldsa65Seed` on the server, `pqv` in the link).
+Nothing classical is offered anywhere: no `vmess`, no `trojan`, no `shadowsocks`, no `ws`, no `httpupgrade`, no `kcp`,
+no `quic`, no `xtls-rprx-direct`.
 
-## What changed against the previous bot
+## What it does
 
-| Area | Before | Now |
-| --- | --- | --- |
-| Transport | Bot API over HTTPS | MTProto, `default_transport="mtproto"`, `intake="mtproto"` |
-| Interface | plain text with inline keyboards | rich messages, `tg-button` rows, streaming drafts |
-| Links | separate iOS and Android builders | one `freeturn://` payload for both platforms |
-| Servers | multi server with per server state | one server, one admin |
-| Remote control | ad hoc shell snippets in `Storage/VKTurn` | RPC v3 of the upstream `install.sh` |
-| Installer | user mode with sudo juggling, user `OBHOD`, `/etc/sudoers.d/vkturn` | root only system service, no extra user, no sudoers entry |
-| Reinstall | in place edits of an existing tree | destructive: everything is removed and installed again from scratch |
-| Core version | whatever the update script downloaded last | pinned `v4.1.0` by default, `latest` only on request |
+| Area | Behaviour |
+| --- | --- |
+| Protocol | `vless` only |
+| Networks | `raw`, `grpc`, `xhttp` |
+| Security | `reality`, `tls`, `none` |
+| VLESS encryption | `mlkem768x25519plus.<native\|xorpub\|random>.<600s\|300-600s\|0s>[.<padding>].<key>` |
+| REALITY signature | optional `ML-DSA-65`, enabled only when the target chain is at least 3500 bytes |
+| Core | Xray pinned to `v26.10.21`, `latest` also selectable, release zip checked against a pinned digest |
+| Scanner | certificate check, TLS 1.3, `h2`, and a raw ClientHello carrying a real ML-KEM-768 key share |
+| Subscriptions | `http://host:port/<64 chars>/<64 chars>`, both segments from `secrets`, url safe alphabet |
+| Fail2ban | jail `3x-ipl` plus `obhod-sshd`, iptables chain `OBHOD-IPL` with exempt ports |
+| SSH | port, password login, root login and public keys managed by a script that runs on the server |
+| Interface | rich GoyGram messages, only `callback_data` buttons, every input through inline query |
+| Languages | `en`, `ru`, `zh`, chosen in the menu and stored in the bot state, English by default and as the fallback |
 
 ## Layout
 
 ```
 BOT/
-  main.py       entry point, logging, signals
-  app.py        router, admin gate, operations, draft orchestration
-  screens.py    every screen as a rich message
-  flows.py      text input fields, validation, state mutations
-  drafts.py     streaming drafts over messages.setTyping
-  control.py    install.sh RPC v3 client with typed responses
-  sshx.py       asyncssh session, host key pinning, root mode detection
-  links.py      freeturn codec, kcp profile, android core config
-  models.py     dataclasses for settings, probe results, clients
-  validate.py   input validators
-  store.py      state.json with 0600 permissions
-  ui.py         html and button helpers
-  xray.py       inbound model, config builder, share links, x25519 keys
-  scan.py       reality scanner: tls 1.3, h2, x25519, certificate chain
-  xrayrpc.py    proto 3 client plus the remote xray script it streams
-  xscreens.py   rich screens for the xray section
-  panel.py      xray operations behind the screens and callbacks
-  inline.py     inline text input: fields, markers, inline results
-  bootstrap.py  root only, ssh first installer for the bot itself
+  app.py        telegram wiring, admin gate, sshd inputs, fail2ban and sshd actions
+  panel.py      xray panel, callback router, field validation, subscriptions
+  screens.py    home, ssh access, settings, fail2ban, sshd, help
+  xscreens.py   xray screens, relevant fields per security and network
+  xray.py       vless model, post quantum encryption, links, config, state
+  scan.py       post quantum probe, certificate parsing, ranking, candidate list
+  xrayrpc.py    RPC client, script bootstrap, subscription state
+  guard.py      fail2ban and sshd actions for the server scripts
+  bootstrap.py  installs the bot itself on the local machine
+  config.py     env loading
+  models.py     sshd port setting and validators
+  shell.py      local command execution, root check, argv only
+  store.py      atomic state file, remembers the interface language
+  i18n.py       lookup by variable, fallback to English, the language switch
+  strings.py    classes EN, RU and ZH with identical variables
+  ui.py         rich html helpers
+  inline.py     inline query fields
 Storage/
-  install.sh          vendored upstream installer, byte identical
-  obhod-install.sh    installer for this bot, root only
-  obhod.service       systemd unit template
-get.sh          curl entry point: clone, sync, run the installer
-tests/          838 tests, mock control, cross repo contract suite, real ssh suite
-requirements.txt
-run.sh          local foreground runner
-pytest.ini
+  remote/xray_agent.py    core install, config apply, keys, subscription service
+  remote/sub_server.py    subscription http server
+  remote/fail2ban_agent.py jail, filter, action, bans
+  remote/ssh_agent.py     sshd drop in, keys, restart
+  obhod-install.sh        bot installer
+  obhod.service           bot unit
+get.sh                      curl one liner
+tests/                      test suite
 ```
 
-## Requirements
+## Crypto decisions
 
-* Python 3.13 or newer with the `venv` module.
-* Root on the machine that runs the bot, for the unit, the config and the state directory.
-* SSH access to the target server, key or password. Root mode, passwordless sudo and sudo with password are detected automatically.
-* Outbound network from the bot host to Telegram MTProto endpoints and to the target server.
+* VLESS encryption is mandatory: `settings.decryption` always carries `mlkem768x25519plus` and the client link always
+  carries `encryption=mlkem768x25519plus.<mode>.<ticket>.<public key>`. An inbound without a generated key pair refuses to
+  render settings or links.
+* REALITY uses an `x25519` key pair for the handshake and an optional `ML-DSA-65` seed for the signature. `mldsa65Seed`
+  appears in `realitySettings` only for `reality`, and only when both the seed and the verify value exist.
+* The scanner treats a target as usable only when it completes TLS 1.3, negotiates `h2`, echoes the
+  `X25519MLKEM768` share, and presents a chain that validates against the system store with a live expiry date.
+* Choices that depend on the selected security and network are the only ones shown first; the rest stay available in a
+  collapsed block, driven by `relevant_fields(security, network)`.
+
+## Localization
+
+Every user facing string lives in `BOT/strings.py` as a class variable: `EN`, `RU` and `ZH` hold the same set of 583
+variables, the Chinese column is written in Chinese, and parameterized strings use `{placeholders}`. `BOT/i18n.py` looks a
+variable up by name (`i18n.t("HOME_TITLE", "ru")`), normalizes a language tag, falls back to English, refuses a key that is
+missing or a call that forgets a placeholder, and exposes `check_catalogs()` for the parity test. The bot starts in
+English, the language screen lists `en`, `ru` and `zh`, the choice is written into the state file by `store.py` and every
+later message, button, hint, error and inline result is rendered in it. Raise messages, log records, RPC stages and shell
+output stay English and are deliberately outside the catalogue.
+
+## Subscriptions
+
+Each client gets two secrets of exactly 64 characters from `A-Za-z0-9-_`, produced by `secrets.choice`. The path is
+`/<sub_id>/<sub_key>`, so the address looks like `http://203.0.113.10:2096/<64>/<64>`. The path of the 3x-ui panel
+(`/sub/<id>`) is never used. `sub_registry` maps `sub_id` to the key, the links, the title and the filename, and
+`Storage/remote/sub_server.py` serves `base64` of the link list with `profile-update-interval` and `subscription-userinfo`
+headers, answering `404` for a wrong key and `403` for a disabled entry.
+
+## Fail2ban
+
+`Storage/remote/fail2ban_agent.py` writes three jails and one action:
+
+| Jail | Filter | Threshold | Ban |
+| --- | --- | --- | --- |
+| `3x-ipl` | `[LIMIT_IP] Email = ... \|\| Disconnecting OLD IP = ...` in the xray access log | `maxretry = 1`, `findtime = 1920` | `30m`, editable in minutes |
+| `obhod-sshd` | the sshd filter over `/var/log/auth.log` or `/var/log/secure` | `maxretry = 3`, `findtime = 3600` | `3d` by default, any value with `s`, `m`, `h`, `d` or `w` |
+| `obhod-subs` | `^sub 40[34] <ADDR>$` from the subscription log | `maxretry = 20`, `findtime = 600` | `3d`, the same duration as the ssh jail |
+
+`action.d/3x-ipl.conf` keeps an `OBHOD-IPL` chain as the first rule of `INPUT` in both `iptables` and `ip6tables`, with the
+ssh and subscription ports exempted, so a banned address is dropped for TCP and still cannot reach the proxy.
+All three jails carry `ignoreip = 127.0.0.1/8 ::1` by default, editable from the bot (addresses are parsed and validated,
+a newline never reaches the config). Durations are written with an explicit suffix, so `bantime = 30m` is thirty minutes
+and `bantime = 3d` is three days, never a bare number that fail2ban would read as seconds. The bot can install, remove,
+reset and report the jails, and never touches the server without an explicit button.
+
+## Security
+
+The repository is written for a host that is exposed to the whole internet, so the defaults are the hardening:
+
+* The proxy has no password at all: VLESS authenticates with a UUID and `mlkem768x25519plus`, subscriptions with two
+  64 character secrets compared with `hmac.compare_digest`, and an invalid path returns the same `404` for an unknown id
+  and a wrong key.
+* `sub_server.py` rate limits every address (60 requests per minute by default, `429` above it), caps concurrent handlers
+  with a semaphore (`503` when the queue is full), sets a fifteen second socket timeout so a slow client cannot hold a
+  thread, truncates the request path, and sanitizes every header value, so a title or a filename cannot inject a header.
+* The release download is allowlisted: `https` only, `github.com`, `objects.githubusercontent.com` or
+  `release-assets.githubusercontent.com` only, `.zip` or `.dgst` only, no credentials in the url, at most three
+  redirects and every redirect hop is checked against the same allowlist, and a local `file://` archive must live under
+  `/opt`, `/tmp` or `/usr/local/bin`. A download is capped at 256 MiB and a release without a digest is refused instead
+  of installed unsigned.
+* The bot limits itself before it does any work: 60 messages, 90 callbacks and 30 inline queries per minute per user, a
+  separate budget of 10 for an expensive callback, and the admin claim is private chat only. A callback that repeats
+  inside two seconds is refused with a toast, so a double tap or a forged replay cannot fire an action twice. The
+  security trail is bounded to 200 events, keeps actor, action and outcome, and marks a field as secret by name only,
+  never by value.
+* A failed core start is rolled back: the previous `config.json` is copied to a `0600` backup before the write, and when
+  the new configuration does not come up the old one is restored and the core is started again. The config write itself
+  is atomic, so a crash cannot leave a half written file, and a symlink at the target path is refused.
+* `sub_server.py` answers a repeated miss with exponential backoff: ten misses or refusals from one address start a
+  block that doubles from one minute up to one hour, one success clears the counters, the counter itself is capped at
+  eight offences, and the bucket table is bounded to 4096 addresses so a scan cannot grow it without limit.
+* The bot has no transport to another machine at all: there is no host, no user, no password, no key and no ssh client
+  in the code. `BOT/shell.py` runs a local process as the same root the bot already is, with `argv` lists and without a
+  shell, so a config value can never become a command line. `LocalShell.require_root` refuses to run as a plain user,
+  and the state file cannot store a credential because `SshSettings` has no field for one.
+* No password exists anywhere: the settings screen reports the local mode and only offers the sshd port and a public
+  key, and the state file carries a port and nothing else.
+* A stranger cannot claim the bot after the first fifteen minutes: with `ADMIN_ID` unset the first user claims it inside
+  that window only, afterwards everyone is denied.
+* Every unit runs with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`,
+  `RestrictNamespaces`, `RestrictSUIDSGID` and a narrow `RestrictAddressFamilies`. The state file is `0600` inside a `0700`
+  directory and never appears in a log line; there is no password to log.
+* `sshd` gets `MaxAuthTries 3`, `LoginGraceTime 20`, `X11Forwarding no`, `AllowAgentForwarding no`,
+  `AllowTcpForwarding no` and `PermitTunnel no`, and password login is refused when the account has no authorized key, so
+  the hardening cannot lock the administrator out.
+* One client has one subscription, not one per inbound. `subscriptions` groups the clients by email, the entry carries
+  every link of that client in `links`, and `sub_server` returns all of them in one base64 body. A second inbound with the
+  same email inherits the identifiers of the first, so adding grpc and xhttp to a client does not create extra
+  subscriptions, and rotation moves all of them at once.
+* The subscription server allows ten requests per minute per address by default (`OBHOD_SUB_RATE`), and the installer
+  and the bot validate their own inputs: the port is numeric inside the allowed range,
+  the state directory is a simple absolute path, the timeouts are clamped, the log level is an allowlist, and the
+  installer refuses a credential with a newline, a carriage return, an `=` or more than 200 characters.
+* `tests/test_pentest.py` is the regression suite for this hardening: path traversal and header injection against the
+  subscription server, backoff and bucket bounds, callback replay, expensive operation limits, a failed core start
+  rolled back, hostile release urls and redirects, credential injection into the installer, and HTML escaping of a
+  hostile inbound name.
+* `tests/test_security.py` attacks the build: traversal and malformed subscription paths, header injection, a request
+  flood, a slow client, hostile release urls and version strings, a credential that a state file tries to reintroduce,
+  admin claim outside the window, shell metacharacters in the bootstrap script and unvalidated values.
+
+## SSH scripts
+
+Subscription links use `sub_address` when it is set, otherwise the address of the outbound interface of the machine
+(detected without sending a packet, loopback and link local results are ignored), so a link never points at `127.0.0.1`.
+
+The bot manages exactly one machine, the one it runs on, and it does it as a local process, not as a login. `BOT/shell.py`
+holds the whole execution layer: `agent_argv` builds `[sys.executable, "-c", source, *argv]`, so the agent script and its
+arguments stay separate argv entries and never meet a shell, and `LocalShell.require_root` refuses anything but `uid 0`.
+`SshSettings` has a port and a mode string, `models.py` has no host, user, password, key, passphrase, fingerprint or auth
+mode, and the state file cannot reintroduce one: unknown keys in `ssh` are ignored while loading. `BootstrapPlan` follows
+the same rule, so `python -m BOT bootstrap` installs onto the current machine only. `requirements.txt` no longer lists
+`asyncssh`, and `BOT/sshx.py` is gone.
+
+`Storage/remote/ssh_agent.py` writes a drop in, validates it with `sshd -t`, restarts the service and rolls back on a
+failure. It can change the port, switch `PasswordAuthentication`, set `PermitRootLogin` to `no` or `prohibit-password`,
+and append a public key to the authorized keys of the first account that has a `.ssh` directory. Keys are appended one
+after another without replacing the previous ones, and the same key is never written twice: the comparison uses the key
+type and the base64 blob, so the same key with another comment is still recognised as a duplicate. Password login can be
+switched back on at any time (`sshd:auth:yes`), while switching it off is refused until at least one key is present, so
+the hardening cannot lock the administrator out. Both scripts are read
+from this repository at call time and executed as a local argv through `BOT/shell.py`, so the repository is the single
+source of truth and no copy of a script lives outside it.
+
+## Configuration
+
+The generated config follows the reference layout of 3x-ui: a `log` block that writes `access.log` and `error.log`
+(fail2ban reads the access log), `dns` when resolvers are set, `stats`, a `policy` block with `statsUserUplink`,
+`statsUserDownlink` and `statsUserOnline` per level, an `api` block with `HandlerService`, `LoggerService`, `StatsService`
+and `RoutingService` plus the local `tunnel` inbound on `127.0.0.1:62789`, a `metrics` listener on `127.0.0.1:11111`,
+`freedom` with `finalRules` that block `geoip:private` and a `blackhole`, and routing rules for the api, private networks
+and `bittorrent`. The api port, the access log path, the dns list and the metrics listener are editable from Settings.
+
+## Scanner
+
+The probe sends a real ClientHello: TLS 1.3, cipher `0x1301`, the `server_name` extension, `supported_groups` with
+`0x11ec` and `0x001d`, the signature algorithms Xray accepts, `supported_versions` and a key share of `0x11ec` built from a
+1184 byte ML-KEM-768 encapsulation key plus a 32 byte X25519 share. It then parses the ServerHello, reads the certificate
+chain through `MemoryBIO`, validates it, and reports latency, days left, the chosen group and whether the chain is long
+enough for ML-DSA-65. `DEFAULT_CANDIDATES` holds 225 hosts, every one of them verified by a live run on 2026-10-27: all 225 complete the
+probe, 114 of them present a chain long enough for `ML-DSA-65`, and the median latency is 114 ms.
 
 ## Install
-
-The shortest path is `get.sh`, which is fetched with `curl`, clones the repository and runs the installer:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/i-execute/OBHOD/main/get.sh | sudo bash
 ```
 
-It refuses to run without root, needs `git` or `curl` plus `tar`, clones `i-execute/OBHOD` into a temporary directory, copies the tree into `/opt/obhod-src`, then runs `Storage/obhod-install.sh install` from there. Because the script itself arrives on stdin, the installer gets `/dev/tty` as its stdin, so the prompts still work.
-
-Fully unattended, with the credentials in the environment:
-
-```
-curl -fsSL https://raw.githubusercontent.com/i-execute/OBHOD/main/get.sh | sudo BOT_TOKEN=123456:ABCDEF API_ID=12345678 API_HASH=<32 hex> ADMIN_ID=<telegram id> bash
-```
-
-That path writes a temporary env file with mode 600 and calls the installer with `--env-file` and `--yes`, so nothing is asked.
-
-| Option | Meaning |
-| --- | --- |
-| `--ref=TAG` or `--ref=branch` | clone or download that revision instead of the default branch |
-| `--repo=owner/name` | use another repository, also `OBHOD_REPO` |
-| `--dir=PATH` | where the sources land, default `/opt/obhod-src`, also `OBHOD_DIR` |
-| `--src=PATH` | skip the download and use a local tree, also `OBHOD_SRC_DIR` |
-| `--env-file=PATH` | where the generated env file goes |
-| `--no-install` | only refresh the sources, print the command to run afterwards |
-| `--dry-run` | print what would happen, touch nothing, no network |
-| `install`, `reinstall`, `update`, `--dev` and other installer flags | passed through to `Storage/obhod-install.sh` |
-
-The repository is cloned into `/opt/obhod-src` and marked with `.obhod-src`, so a later run replaces exactly that directory and leaves anything else alone. Git files, `__pycache__` and virtual environments are never copied.
-
-The manual path, without the helper script:
-
-```
-sudo bash Storage/obhod-install.sh install
-```
-
-The installer asks for the bot token, `api_id`, `api_hash` and the admin id, copies the payload to `/opt/obhod`, builds the virtual environment, writes `/etc/obhod/obhod.env` with mode 600 and starts `obhod.service`.
-
-Started as a normal user it stops immediately and prints the command to run with `sudo`. Nothing is written in that case.
-
-```
-bash Storage/obhod-install.sh install
-bash Storage/obhod-install.sh reinstall
-bash Storage/obhod-install.sh update
-bash Storage/obhod-install.sh status
-bash Storage/obhod-install.sh restart
-bash Storage/obhod-install.sh logs
-bash Storage/obhod-install.sh uninstall
-```
-
-Options: `--yes` accepts values already present in the env file, `--prefix=PATH`, `--env-file=PATH`, `--python=PATH`, `--skip-deps` copies the payload without building a virtual environment, and `--dev` installs under `$HOME/.obhod` without root for local testing only.
-
-`reinstall` is destructive by design: it stops and disables the unit, kills every process started from the install prefix, deletes `/opt/obhod` and then installs from zero. Credentials in the env file survive unless `--purge-all` is given, which also deletes `/etc/obhod/obhod.env` and the state directory and therefore requires the credentials to be entered again.
-
-## Configuration
-
-`/etc/obhod/obhod.env`:
-
-```
-BOT_TOKEN=123456:ABCDEF
-API_ID=12345678
-API_HASH=0123456789abcdef0123456789abcdef
-ADMIN_ID=123456789
-OBHOD_STATE_DIR=/var/lib/obhod
-OBHOD_INSTALL_SCRIPT=/opt/obhod/Storage/install.sh
-OBHOD_LOG_LEVEL=INFO
-```
-
-Optional keys: `OBHOD_SESSION`, `OBHOD_CONNECT_TIMEOUT`, `OBHOD_COMMAND_TIMEOUT`, `OBHOD_APPLY_TIMEOUT`, `OBHOD_DC_HOST`, `OBHOD_DC_PORT`. The same keys are read from the environment, and `OBHOD_ENV` points the bot at a different env file.
-
-`ADMIN_ID` may be left empty. In that case the first account that writes to the bot becomes the admin and the id is stored in `state.json`; every later account is refused. When `ADMIN_ID` is set it always wins.
-
-Only the admin is served. Messages and callbacks from anyone else get a short refusal, no state is read and no remote command runs.
-
-## Xray
-
-The bot configures the Xray core on the same server it already reaches over SSH. There is no panel binary and no inbound database: the configuration is generated bot side from `BOT/xray.py` and streamed to the server, where the remote script validates it with `xray run -test` before it is written to `/usr/local/etc/xray/config.json`.
-
-* Protocols: `vless`, `vmess`, `trojan`, `shadowsocks`. Networks: `tcp`, `ws`, `grpc`, `httpupgrade`, `xhttp`. Security: `reality`, `tls`, `none`. Reality is offered only for `tcp`, `grpc` and `xhttp`, because the core rejects anything else.
-* Inbound screen: summary table, reality keys with copy buttons, inline input buttons for `server name`, `dest`, `path`, `service name`, port and remark, client list, per client link, key regeneration through `xray x25519` on the server, enable toggle, two step removal.
-* Share links follow the 3x-ui recipe exactly: `vless://uuid@host:port` with `flow` only for `tcp` and `reality` or `tls`, `trojan://password` with `flow` only for `tcp` plus `reality`, `ss://` base64url for classic methods and the SIP022 `method:inboundPassword:clientPassword` form for `2022-*`, query parameters `type`, `path`, `host`, `serviceName`, `security`, `sni`, `pbk`, `sid`, `fp`, `spx`, `flow`, `encryption`.
-* Core screen: install or update, apply configuration, restart, stop, purge, log level, state table with version, service state, ports, listening ports and a config digest.
-
-## Reality scanner
-
-`BOT/scan.py` ports the 3x-ui scanner without the panel: ten second timeout, four second discovery timeout, concurrency 32, at most 256 addresses per subnet and 512 targets per run, private and loopback ranges blocked, results deduplicated by target preferring a feasible candidate and then lower latency.
-
-A target is feasible when the handshake negotiates TLS 1.3, HTTP/2 through ALPN, the X25519 group and a certificate that verifies. The certificate is walked in DER without a third party library: subject, issuer, `notAfter` and subject alternative names. One command probes a target, scans a list, scans a subnet, and applies the best candidate to a reality inbound as `dest` plus `serverName`.
-
-## Inline input
-
-Text fields open an inline form instead of asking for the next chat message. The button is `switch_inline_query_current_chat` and carries a prefilled query such as `ob xr_sni 3 `. The bot answers the inline query with one article per action: save, clear, cancel, plus the field picker when the query is empty. Choosing a result posts a marker message `#ob <field> <context> <value>` that the bot consumes and deletes, then re-renders the screen it came from.
-
-Fields with the same machinery: `ssh_host`, `ssh_port`, `ssh_user`, `ssh_password`, `ssh_key`, `ssh_sudo`, every xray field, the scan target list, the log level. Secrets are masked in the inline result description and the marker message is removed after it is read.
-
-Inline mode has to be enabled for the bot by its owner with `@BotFather` and `/setinline`; the bot does not try to work around that, and the text input path from the previous round keeps working as a fallback. Inline answers are restricted to the configured admin id, so a stranger who finds the bot gets an empty result list instead of a list of this server's field names.
-
-## Bootstrap
-
-`python -m BOT bootstrap` mirrors the Feroku install shape and keeps it minimal:
-
-1. Only check that the process runs as root, otherwise refuse with an instruction to run under `sudo`.
-2. Copy the payload over SSH into `/opt/obhod` and build the virtual environment there.
-3. Ask for the numeric Telegram id, compare it with the configured admin id, and only accept the same account.
-4. Only after that identity check, write `/etc/obhod/obhod.env` with mode 600, install `obhod.service`, start it and hand the rest of the work to the bot in Telegram.
-
-`python -m BOT bootstrap --check --ssh-host <host>` is the read only preflight: one ssh call, one line per condition (`root`, `python3`, `systemd`, `tar`, free space, `github.com` and `api.telegram.org` reachable from the server itself), exit code 0 only when every line is `ok`. It writes nothing, so it is safe to run before anything is installed.
-
-`bootstrap.payload_archive` builds the tarball in memory, skipping caches and the test tree.
-
-## Screens
-
-* Home: connection state, server address, admin state, entry points to every section.
-* Server: full probe result, apply, stop, restart, links to logs, SSH settings, install parameters, maintenance.
-* SSH: host, port, user, auth mode, password, private key, key passphrase, sudo password, host key pinning reset.
-* Install parameters: backend `new` or `external`, method `docker` or `systemd`, listen port, wireguard port and subnet, external vpn address, mode `udp` or `tcp`, obfuscation profile, obfuscation key, core version, public host for the link.
-* Obfuscation: `rtpopus3`, `rtpopus2`, `rtpopus`, `none`, plus key generation.
-* Clients: allowlist with peer addresses and handshake flags, per client screen with link building, WireGuard config, core config snapshot and two step removal.
-* Connection parameters: threads, streams per credential, transport, tunnel mode, bond, timing, local listen address, DNS mode and servers, manual captcha, call link.
-* Logs: tail selector 50, 200, 500.
-* Maintenance: core update, destructive reinstall, restart, uninstall, each behind its own confirmation screen.
-* Help and link import: offline `freeturn://` parsing with a field by field summary.
-
-Long operations run inside a draft: the bot sends `messages.setTyping` with a rich draft action, keeps it updated while SSH work proceeds, then stops the draft and posts the final screen in place of the pressed message.
-
-## Remote protocol
-
-The bot never calls docker or systemd on the server directly. It pipes the vendored `install.sh` into `bash -s -- <command>` over SSH and reads the last JSON line of the output:
-
-```
-{"proto":3,"result":"ok","data":{...},"logs":[...]}
-```
-
-Commands used: `probe`, `apply`, `stop`, `restart`, `logs`, `client-list`, `client-add`, `client-conf`, `client-remove`, `uninstall`.
-
-Root runs the command as is, passwordless sudo prefixes `sudo -n`, sudo with password prefixes `sudo -k -S -p ''` and sends the password as the first stdin line ahead of the script body. Any protocol version other than 3 is reported as `proto_mismatch` instead of being misinterpreted.
-
-Defaults follow the upstream core: entry port 56000, wireguard subnet `10.13.13.0/24`, wireguard port 51820, mtu 1280, client side `127.0.0.1:9000`, kcp profile with nodelay 1, interval 20, resend 2, nc 1, windows 512, mtu 1200, acknodelay, obfuscation key of 64 hex characters.
-
-## Core version
-
-The bot never installs an unpinned floating build. `BOT/models.py` carries `CORE_VERSION = "v4.1.0"` and that value is the default for `ServerOptions.version`, so every `apply` sends `--version=v4.1.0` and the server downloads
-
-```
-https://github.com/hackdiaz-dev/free-turn-proxy/releases/download/v4.1.0/server-linux-<arch>
-```
-
-The Xray core is pinned to `v26.10.21` in `BOT/xrayrpc.py` with its published digest `0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978` for `Xray-linux-64.zip`. The remote script reads the `.dgst` sidecar next to the release, falls back to that pinned digest when the sidecar cannot be fetched, and refuses the archive when neither matches. When GitHub is unreachable the pinned version and digest are still what the install command tries first, so a failed lookup never turns into an unpinned download.
-
-`latest` is available from the install parameters screen as an explicit second button, and a `vX.Y.Z` value can be typed in by hand. `local`, which would need an uploaded binary, is refused. A version reported by `probe` is normalised to the `vX.Y.Z` form install.sh validates, a value that does not parse is dropped instead of being written back, so the pin cannot silently drift after a probe.
-
-## Reinstall from scratch
-
-`maint:reset2` and `srv:reset2` run `ControlClient.hard_reset` in five steps:
-
-1. `install.sh uninstall --target=all --purge`, which stops the container or unit, closes the firewall port, removes the own wireguard interface and purges `/opt/free-turn-proxy`.
-2. A cleanup script streamed over the same `bash -s` channel: `docker rm -f free-turn-proxy`, `systemctl disable --now free-turn-proxy.service`, removal of the unit file and daemon reload, `wg-quick down ft-wg0`, `ip link del ft-wg0`, `pkill -f /opt/free-turn-proxy`, removal of `/etc/wireguard/ft-wg0.conf`, `/etc/sysctl.d/99-free-turn-proxy.conf`, `/usr/local/bin/freeturn` and the prefix itself.
-3. `probe` again. If the server still reports an installation, the operation is aborted with an explicit error and nothing is installed on top of leftovers.
-4. `apply` with the full option set and `--update`, so the pinned release is downloaded again instead of reusing anything.
-5. `probe` plus `client-list`, which must report a running core.
-
-The cleanup script contains no comment lines, is validated with `bash -n` in the test suite, is executed for real against the ssh test server, and only ever touches the paths the upstream installer owns. The vendored `Storage/install.sh` is not modified by any of this: the same bytes the mobile client ships are streamed for every call.
-
-## Links
-
-`freeturn://` plus base64url of a compact JSON body:
-
-```
-{"v":1,"provider":"vk","peer":"host:56000","obf":"rtpopus3","key":"...","timing":0,
- "n":12,"spc":12,"cid":"client-id","name":"owner","listen":"127.0.0.1:9000",
- "dns":"plain","dnss":"1.1.1.1","mcap":false,"vk":"call link","wg":"[Interface]..."}
-```
-
-There is no platform field and no separate iOS variant. The same payload feeds the Android core configuration view on the client screen, which mirrors the shape the mobile client expects when it starts.
+The installer refuses a non root user, installs into `/opt/obhod`, keeps the state in `/var/lib/obhod`, and the bot is
+started as `obhod.service`. Reinstalling removes the previous installation first.
 
 ## Tests
 
 ```
-python -m venv .venv
-.venv/bin/pip install -r requirements.txt pytest pytest-asyncio pyflakes
-.venv/bin/python -m pytest
+python -m pytest
 ```
 
-803 tests covering validators, the link codec, kcp clamping, RPC parsing, argument quoting, store permissions, every screen, every callback route, the admin gate and admin claim, apply, stop, restart, logs, client add and remove flows, drafts, destructive reinstall, installer refusal, payload copy, reinstall and leftover process cleanup, plus a real SSH suite that starts a local asyncssh server, executes the vendored `install.sh` and the cleanup script for real and checks the parsed result.
-
-`tests/test_contract.py` opens the Android client sources at `FREETURN_ANDROID_DIR` (default `/home/user/turn-proxy-android`) and compares this bot against them: the RPC command set, the `apply` flag set, the error code enum, the JSON field names of `probe`, `apply`, `client-list` and `logs`, the `freeturn://` key order, the kcp defaults, the `bash -s --` launch shape with `sudo -n` and `sudo -k -S -p ''`, the script asset name and the protocol version. The test skips with a clear reason when the Android tree is not present, and every expectation is also frozen in the test file so the suite still runs on its own.
-
-New suites for this round: `tests/test_xray.py` for the inbound model, the config builder and every share link shape, `tests/test_scan.py` for the scanner including a real local TLS server and an openssl certificate walked by the DER reader, `tests/test_xrayrpc.py` for the remote script executed for real in a temporary root with a fake core plus an end to end run over an in process SSH server, `tests/test_panel.py` for every xray callback and every inline field, `tests/test_xscreens.py` for the new screens and their button budgets, `tests/test_inline.py` for markers and inline results, `tests/test_bootstrap.py` for the root check, the `--check` preflight, the identity gate and the payload.
-
-`tests/test_source.py` enforces the source rules: no comments, no docstrings, no emoji, no long dashes, no left over markers in the code written for this bot. `Storage/install.sh` is exempt because it is the vendored upstream installer and is kept byte identical on purpose.
-
-## Security notes
-
-* `state.json` lives in `OBHOD_STATE_DIR` with mode 600, the directory is 700, writes are atomic through a temporary file and `os.replace`.
-* Passwords and keys only travel to the target server over SSH, they are never rendered in a message; the screens show a masked length instead.
-* A password or key typed into the chat is confirmed by a notice that does not repeat the value; the bot deletes nothing on the Telegram side, so secrets typed into a chat stay in that chat history.
-* Host keys are pinned on first successful connection, a change is refused with an explicit error and can be reset from the SSH screen.
-* The unit runs with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome` and a single writable state directory.
-
-## Where the old scripts went
-
-No script was silently dropped. The whole `/opt/vkturn` plus `sudoers` model is replaced by the upstream `install.sh` RPC, and `REPORT.md` carries the same table with a line per file.
-
-| Old file | Was doing | Now |
-| --- | --- | --- |
-| `Storage/VKTurn/setup_root.sh` | created user `OBHOD`, `/opt/vkturn`, own `wg0` on `192.168.102.0/24`, nft/iptables rules | `install.sh apply`, own `ft-wg0` on `10.13.13.0/24`, no extra user |
-| `Storage/VKTurn/add_client.sh` | inserted a client id into `/etc/wireguard/clients.json` | `install.sh client-add`, allowlist handled by the core |
-| `Storage/VKTurn/add_peer_android.sh` | wireguard peer plus `freeturn://` link | `install.sh client-add` and `client-conf`, one link |
-| `Storage/VKTurn/add_peer_ios.sh` | peer plus `vkturnproxy://import?data=` link with the wrap key | removed, iOS takes the same `freeturn://` link |
-| `Storage/VKTurn/ensure_profile.sh` | `profiles.json` plus `/etc/wireguard/wrap.key` | `--obf-profile` and `--obf-key` of the core, no `-wrap` scheme |
-| `Storage/VKTurn/revoke_peer.sh` | cut a peer, removed the client id, deleted the peer files | `install.sh client-remove` |
-| `Storage/VKTurn/update_core.sh` | downloaded a binary and swapped it in place | `install.sh apply --update`, version pinned |
-| `Storage/Installation/Setuper.sh` | cloned the repo into `/home/OBHOD`, `useradd -m`, `loginctl enable-linger`, systemd user unit, `/etc/sudoers.d/vkturn` | `Storage/obhod-install.sh`, root only, `/opt/obhod`, `obhod.service`, no user, no sudoers |
-| `Storage/Installation/QuickStart.sh` | `curl` of `Setuper.sh` from `raw.githubusercontent.com` | not needed, the payload is local and offline |
-| `Storage/Installation/APICerds.py` | printed a hardcoded list of third party `api_id` and `api_hash` pairs | removed, the operator supplies their own credentials |
-| `BOT/Modules/VKTurn.py` | menu, VK call sourcing, peer and profile management, per platform links | `BOT/app.py`, `BOT/screens.py`, `BOT/flows.py`, `BOT/links.py` |
-| `BOT/Modules/Updater.py` | GitHub release download with a stored token and a marker file | `install.sh apply --update`, `probe` reports the version |
-| `BOT/protection.py` | flood counter for a multi user bot | single admin gate in `BOT/app.py` |
-| `BOT/strings.py` and `BOT/Strings/*.yml` | three languages in yml | one language in code, screens are functions |
-| `BOT/core.py`, `BOT/installer.py` | telethon bot loop and the in chat installer | `BOT/main.py`, `BOT/app.py`, `GoyGram` over MTProto |
-
-The user `OBHOD` is not created any more. The old `Setuper.sh` did `useradd -m -s /bin/bash OBHOD`, installed to `/home/OBHOD/OBHOD`, enabled linger and granted `NOPASSWD` on seven `/opt/vkturn` scripts. The new installer creates no account at all: it installs system wide into `/opt/obhod`, writes `/etc/obhod/obhod.env` with mode 600, keeps state in `/var/lib/obhod` with mode 700 and runs `obhod.service` as a system unit.
+574 tests cover the post quantum encryption strings, links, config generation, state, subscriptions, the scanner, every
+screen, every callback route, the admin gate, the panel field rules, the fail2ban files, the ssh agent, the local shell and the running
+subscription server, plus the three catalogues, their placeholder parity and the hardening suite in
+`tests/test_security.py`. `tests/test_source.py` fails the build if any
+Python comment, docstring, emoji or long dash appears in the repository, and if any Cyrillic or CJK character appears
+outside `BOT/strings.py`.

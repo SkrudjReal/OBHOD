@@ -3,11 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import inline
+from . import i18n
 from .scan import ScanResult
-from .xray import SCAN_DEFAULTS, XRAY_VERSION, XrayInbound, XrayState, summary
 from .ui import (
-    big,
     bold,
     bullet_list,
     button,
@@ -17,7 +15,6 @@ from .ui import (
     divider,
     heading,
     inline_button,
-
     muted,
     pre,
     quote,
@@ -25,8 +22,52 @@ from .ui import (
     screen,
     table,
 )
+from .xray import (
+    FINGERPRINTS,
+    NETWORKS,
+    SECURITIES,
+    SUB_SEGMENT_LEN,
+    XrayInbound,
+    XrayState,
+    relevant_fields,
+    summary,
+)
 
 MAX_LINKS = 4
+
+FIELD_LABELS = {
+    "dest": "FIELD_DEST",
+    "sni": "FIELD_SNI",
+    "short_id": "FIELD_SHORT_ID",
+    "spider_x": "FIELD_SPIDER_X",
+    "fingerprint": "FIELD_FINGERPRINT",
+    "mldsa65": "FIELD_MLDSA65",
+    "service": "FIELD_SERVICE",
+    "path": "FIELD_PATH",
+    "host_header": "FIELD_HOST_HEADER",
+    "mode": "FIELD_MODE",
+    "alpn": "FIELD_ALPN",
+    "cert_file": "FIELD_CERT_FILE",
+    "key_file": "FIELD_KEY_FILE",
+}
+
+FIELD_BUTTONS = {
+    "dest": "xr_dest",
+    "sni": "xr_sni",
+    "short_id": "xr_short_id",
+    "spider_x": "xr_spider_x",
+    "fingerprint": "xr_fingerprint",
+    "mldsa65": "xr_mldsa65_seed",
+    "service": "xr_service",
+    "path": "xr_path",
+    "host_header": "xr_host_header",
+    "alpn": "xr_alpn",
+    "cert_file": "xr_cert_file",
+    "key_file": "xr_key_file",
+}
+
+ALL_FIELDS = tuple(FIELD_LABELS)
+
 
 @dataclass
 class XrayView:
@@ -36,6 +77,7 @@ class XrayView:
     error: str = ""
     busy: str = ""
     draft: dict[str, str] = field(default_factory=dict)
+    lang: str = i18n.DEFAULT_LANGUAGE
 
     @property
     def installed(self) -> bool:
@@ -49,326 +91,426 @@ class XrayView:
     def version(self) -> str:
         return str(self.core.get("version", "") or "")
 
-def banner(view: XrayView) -> list[str]:
+    def tr(self) -> i18n.Translator:
+        return i18n.translator(self.lang)
+
+
+def field_label(name: str, lang: str) -> str:
+    return i18n.t(FIELD_LABELS.get(name, "FIELD_UNKNOWN"), lang)
+
+
+def banner(view: XrayView, t: i18n.Translator) -> list[str]:
     out: list[str] = []
     if view.notice:
         out.append(quote(muted(view.notice)))
     if view.error:
         out.append(quote(bold(view.error)))
+    if view.busy:
+        out.append(quote(muted(view.busy)))
     return out
 
-def core_line(view: XrayView) -> str:
-    if not view.core:
-        return bold("ядро не проверено")
-    parts = ["ядро установлено" if view.installed else "ядро не установлено"]
-    if view.installed:
-        parts.append(view.version or "версия неизвестна")
-        parts.append("запущено" if view.running else "остановлено")
-        if view.core.get("port"):
-            parts.append(f"порт {view.core['port']}")
-    return bold(", ".join(parts))
 
-def back_row(target: str = "xr:home") -> str:
-    return row(button("Xray", target), button("Главная", "nav:home"))
+def core_line(view: XrayView, t: i18n.Translator) -> str:
+    if not view.core:
+        return muted(t("HOME_CORE_UNKNOWN"))
+    if not view.installed:
+        return bold(t("HOME_CORE_MISSING"))
+    state = t("HOME_CORE_RUNNING") if view.running else t("HOME_CORE_STOPPED")
+    return bold(t("HOME_CORE_STATE", version=str(view.core.get("version", "") or ""), state=state))
+
+
+def back_row(target: str = "nav:home", lang: str = i18n.DEFAULT_LANGUAGE) -> str:
+    return row(button(i18n.t("UI_HOME", lang), target), button(i18n.t("NAV_XRAY", lang), "xr:home"))
+
 
 def home(view: XrayView) -> Any:
+    t = view.tr()
     state = view.state
-    blocks = banner(view)
-    blocks.append(f"<p>{core_line(view)}</p>")
-    blocks.append(f"<p>цель: {code(view.core.get('config_path', '') or 'не задана')}</p>")
+    blocks = banner(view, t)
+    blocks.append(f"<p>{core_line(view, t)}</p>")
+    pairs = [
+        (t("XR_HOME_INBOUNDS"), code(len(state.inbounds))),
+        (t("XR_HOME_CLIENTS"), code(sum(len(item.clients) for item in state.inbounds))),
+        (t("XR_HOME_SUBS"), code(t("UI_ON") if state.sub_enabled else t("UI_OFF"))),
+        (t("XR_HOME_SUB_PORT"), code(state.sub_port)),
+        (t("XR_HOME_VERSION"), code(state.version)),
+        (t("XR_HOME_ENCRYPTION"), code(state.encryption_label())),
+    ]
+    blocks.append(table(pairs, (t("UI_PARAM"), t("UI_VALUE"))))
     if state.inbounds:
-        pairs = []
+        rows = []
         for item in state.inbounds:
-            mark = "вкл" if item.enable else "выкл"
-            pairs.append((f"{item.id} {item.remark}", f"{item.protocol} {item.port} {mark}"))
-        blocks.append(table(pairs, ("инбаунд", "параметры")))
+            mark = t("UI_ON") if item.enable else t("UI_OFF")
+            rows.append((f"{item.id} {item.remark}", f"{item.port} {item.network} {item.security} {mark}"))
+        blocks.append(table(rows, (t("XR_HOME_TABLE"), t("XR_HOME_TABLE2"))))
     else:
-        blocks.append(quote(muted("инбаундов пока нет, создайте первый")))
+        blocks.append(quote(muted(t("XR_HOME_EMPTY"))))
     buttons = [
-        row(button("Новый инбаунд", "xr:new"), button("Сканер подсети", "xr:scan")),
-        row(button("Ядро", "xr:core"), button("Состояние", "xr:check")),
-        row(button("Логи", "xr:logs"), button("Проверить сервер", "srv:check")),
-        back_row("nav:server"),
+        row(button(t("XR_BTN_NEW"), "xr:new"), button(t("NAV_SCANNER"), "xr:scan")),
+        row(button(t("NAV_SUBS"), "xr:subs"), button(t("NAV_CORE"), "xr:core")),
+        row(button(t("NAV_LOGS"), "xr:logs"), button(t("XR_BTN_CHECK"), "xr:check")),
     ]
     if state.inbounds:
-        buttons.insert(2, row(*[button(f"открыть {item.remark}", f"xr:in:{item.id}") for item in state.inbounds[:3]]))
-    return screen("Xray", "панель инбаундов и ядра", blocks, buttons, footer="конфигурация собирается ботом")
+        buttons.insert(2, row(*[button(t("XR_BTN_OPEN", remark=item.remark), f"xr:in:{item.id}") for item in state.inbounds[:3]]))
+    buttons.append(back_row())
+    return screen(t("XR_TITLE"), t("XR_SUBTITLE"), blocks, buttons, footer=t("XR_FOOTER"))
+
 
 def new_menu(view: XrayView) -> Any:
-    blocks = banner(view)
-    blocks.append(quote(muted("выберите протокол, сеть и безопасность, затем задайте порт")))
+    t = view.tr()
+    blocks = banner(view, t)
+    blocks.append(quote(muted(t("XR_NEW_NOTE"))))
     blocks.append(
         bullet_list(
             [
-                f"протоколы: {code('vless')} {code('vmess')} {code('trojan')} {code('shadowsocks')}",
-                f"сети: {code('tcp')} {code('ws')} {code('grpc')} {code('httpupgrade')} {code('xhttp')}",
-                f"безопасность: {code('reality')} {code('tls')} {code('none')}",
+                t("XR_NEW_NETWORKS", networks=" ".join(code(item) for item in NETWORKS)),
+                t("XR_NEW_SECURITY", security=" ".join(code(item) for item in SECURITIES)),
+                t("XR_NEW_ENCRYPTION", encryption=code("mlkem768x25519plus")),
+                t("XR_NEW_SIGNATURE", signature=code("ml-dsa-65")),
             ]
         )
     )
     buttons = [
-        row(button("vless reality", "xr:new:vless:reality"), button("vless tls", "xr:new:vless:tls")),
-        row(button("vmess ws", "xr:new:vmess:none:ws"), button("trojan reality", "xr:new:trojan:reality")),
-        row(button("shadowsocks", "xr:new:shadowsocks:none"), button("Свой набор", "xr:custom")),
+        row(button("raw reality", "xr:new:raw:reality"), button("raw tls", "xr:new:raw:tls")),
+        row(button("grpc reality", "xr:new:grpc:reality"), button("grpc tls", "xr:new:grpc:tls")),
+        row(button("xhttp reality", "xr:new:xhttp:reality"), button("xhttp tls", "xr:new:xhttp:tls")),
+        row(button("raw none", "xr:new:raw:none"), button(t("XR_BTN_CUSTOM"), "xr:custom")),
         back_row(),
     ]
-    return screen("Новый инбаунд", "готовые наборы", blocks, buttons)
+    return screen(t("XR_NEW_TITLE"), t("XR_NEW_SUBTITLE"), blocks, buttons)
+
 
 def custom_menu(view: XrayView) -> Any:
-    blocks = banner(view)
-    blocks.append(f"<p>сеть {code(grab(view, 'network'))}, безопасность {code(grab(view, 'security'))}, протокол {code(grab(view, 'protocol'))}</p>")
+    t = view.tr()
+    blocks = banner(view, t)
+    network = grab(view, "network")
+    security = grab(view, "security")
+    blocks.append(
+        f"<p>{t('XR_CUSTOM_STATE', network=code(network), security=code(security), port=code(grab(view, 'port')))}</p>"
+    )
+    fields = relevant_fields(security or "reality", network or "raw")
+    names = ", ".join(code(field_label(item, view.lang)) for item in fields) or muted(t("XR_CUSTOM_NOTHING"))
+    blocks.append(f"<p>{t('XR_CUSTOM_NEEDS', fields=names)}</p>")
     buttons = [
-        row(button("протокол", "xr:cyc:protocol"), button("сеть", "xr:cyc:network")),
-        row(button("безопасность", "xr:cyc:security"), button("Создать", "xr:create")),
-        row(inline_button("порт", inline.prefill("xr_port"))),
+        row(button(t("XR_CUSTOM_NETWORK"), "xr:cyc:network"), button(t("XR_CUSTOM_SECURITY"), "xr:cyc:security")),
+        row(button(t("UI_CREATE"), "xr:create")),
+        row(inline_button(t("XR_CUSTOM_PORT"), inline_prefill("xr_port"))),
         back_row(),
     ]
-    return screen("Свой инбаунд", "переключайте параметры и создайте", blocks, buttons)
+    return screen(t("XR_CUSTOM_TITLE"), t("XR_CUSTOM_SUBTITLE"), blocks, buttons)
+
+
+def inline_prefill(ident: str, ctx: str = "-") -> str:
+    from . import inline
+
+    return inline.prefill(ident, ctx)
+
 
 def grab(view: XrayView, key: str) -> str:
     return str(view.draft.get(key, ""))
 
-def inbound_screen(view: XrayView, inbound: XrayInbound) -> Any:
-    blocks = banner(view)
-    blocks.append(f"<h3>{bold(inbound.remark)}</h3>")
-    blocks.append(table(summary(inbound), ("параметр", "значение")))
-    if inbound.security == "reality":
-        blocks.append(
-            details(
-                "ключи reality",
-                table(
-                    [
-                        ("public key", code(inbound.public_key or "нет")),
-                        ("short id", code((inbound.short_ids or [""])[0])),
-                        ("fingerprint", code(inbound.fingerprint)),
-                    ],
-                    ("поле", "значение"),
-                ),
-                open_=False,
-            )
-        )
-    clients = [item.email for item in inbound.clients]
-    blocks.append(f"<p>клиентов {code(len(clients))}: {escaped_join(clients) if clients else muted('нет')}</p>")
-    buttons = [
-        row(button("Ссылки", f"xr:link:{inbound.id}"), button("Добавить клиента", f"xr:cladd:{inbound.id}")),
-        row(*[button(f"клиент {item.email}", f"xr:cl:{inbound.id}:{item.email}") for item in inbound.clients[:3]]),
-        row(button("Порт", f"xr:edit:{inbound.id}:xr_port"), button("Имя", f"xr:edit:{inbound.id}:xr_remark")),
-        row(button("Ключи", f"xr:keys:{inbound.id}"), button("Вкл/выкл", f"xr:toggle:{inbound.id}")),
-        row(button("Удалить", f"xr:del:{inbound.id}"), button("К списку", "xr:home")),
-        back_row(),
-    ]
-    if inbound.security == "reality":
-        buttons.insert(
-            3,
-            row(
-                inline_button("server name", inline.prefill("xr_sni", str(inbound.id))),
-                inline_button("dest", inline.prefill("xr_dest", str(inbound.id))),
-            ),
-        )
-    if inbound.network in {"ws", "httpupgrade", "xhttp"}:
-        buttons.insert(4, row(inline_button("path", inline.prefill("xr_path", str(inbound.id)))))
-    if inbound.network == "grpc":
-        buttons.insert(4, row(inline_button("service", inline.prefill("xr_service", str(inbound.id)))))
-    return screen("Инбаунд", f"id {inbound.id}", blocks, buttons)
 
-def escaped_join(items: list[str]) -> str:
-    return ", ".join(code(item) for item in items[:6])
+def field_pairs(inbound: XrayInbound, names: tuple[str, ...], lang: str) -> list[tuple[str, str]]:
+    data = {
+        "dest": inbound.dest,
+        "sni": inbound.sni,
+        "short_id": (inbound.short_ids or [""])[0],
+        "spider_x": inbound.spider_x,
+        "fingerprint": inbound.fingerprint,
+        "mldsa65": None,
+        "service": inbound.service_name,
+        "path": inbound.path,
+        "host_header": inbound.host_header,
+        "mode": inbound.xhttp_mode,
+        "alpn": ", ".join(inbound.alpn),
+        "cert_file": inbound.cert_file,
+        "key_file": inbound.key_file,
+    }
+    out: list[tuple[str, str]] = []
+    for name in names:
+        if name == "mldsa65":
+            value = i18n.t("UI_ON", lang) if inbound.mldsa65_seed else i18n.t("UI_OFF", lang)
+        else:
+            value = str(data.get(name) or i18n.t("UI_NONE", lang))
+        out.append((field_label(name, lang), code(value)))
+    return out
+
+
+def inbound_screen(view: XrayView, inbound: XrayInbound) -> Any:
+    t = view.tr()
+    blocks = banner(view, t)
+    blocks.append(f"<h3>{bold(inbound.remark)}</h3>")
+    blocks.append(table(summary(inbound, view.lang), (t("UI_PARAM"), t("UI_VALUE"))))
+    fields = relevant_fields(inbound.security, inbound.network)
+    blocks.append(heading(t("XR_INBOUND_RELEVANT"), 4))
+    blocks.append(table(field_pairs(inbound, fields, view.lang), (t("UI_FIELD"), t("UI_VALUE"))))
+    rest = tuple(item for item in ALL_FIELDS if item not in fields)
+    if rest:
+        blocks.append(details(t("XR_INBOUND_REST"), table(field_pairs(inbound, rest, view.lang), (t("UI_FIELD"), t("UI_VALUE")))))
+    clients = [item.email for item in inbound.clients]
+    named = ", ".join(code(item) for item in clients[:6]) or muted(t("UI_NONE"))
+    blocks.append(f"<p>{t('XR_INBOUND_CLIENTS', count=code(len(clients)), names=named)}</p>")
+    buttons = [
+        row(button(t("XR_BTN_LINKS"), f"xr:link:{inbound.id}"), button(t("XR_BTN_ADD_CLIENT"), f"xr:cladd:{inbound.id}")),
+        row(*[button(t("XR_BTN_CLIENT", email=item.email), f"xr:cl:{inbound.id}:{item.email}") for item in inbound.clients[:3]]),
+        row(button(t("XR_BTN_PORT"), f"xr:edit:{inbound.id}:xr_port"), button(t("XR_BTN_NAME"), f"xr:edit:{inbound.id}:xr_remark")),
+        field_row(inbound, view.lang),
+        row(button(t("XR_BTN_REALITY_KEYS"), f"xr:keys:{inbound.id}"), button(t("XR_BTN_MLDSA"), f"xr:mldsa:{inbound.id}")),
+        row(button(t("XR_BTN_TOGGLE"), f"xr:toggle:{inbound.id}"), button(t("UI_DELETE"), f"xr:del:{inbound.id}")),
+        back_row("xr:home"),
+    ]
+    return screen(t("XR_INBOUND_TITLE"), t("XR_INBOUND_SUBTITLE", ident=inbound.id), blocks, buttons)
+
+
+def field_row(inbound: XrayInbound, lang: str) -> str:
+    names = relevant_fields(inbound.security, inbound.network)
+    buttons = [inline_button(field_label(name, lang), inline_prefill(FIELD_BUTTONS[name], str(inbound.id))) for name in names if name in FIELD_BUTTONS]
+    if not buttons:
+        return ""
+    return row(*buttons[:2])
+
 
 def links_screen(view: XrayView, inbound: XrayInbound, address: str, links: list[tuple[str, str]]) -> Any:
-    blocks = banner(view)
-    blocks.append(f"<p>адрес {code(address)}</p>")
+    t = view.tr()
+    blocks = banner(view, t)
+    blocks.append(f"<p>{t('XR_LINKS_ADDRESS', address=code(address))}</p>")
     if not links:
-        blocks.append(quote(bold("у инбаунда нет клиентов, добавьте клиента")))
+        blocks.append(quote(bold(t("XR_LINKS_EMPTY"))))
     for name, link in links[:MAX_LINKS]:
         blocks.append(heading(name, 4))
         blocks.append(pre(link))
     buttons = [
-        row(*[copy_button(f"копировать {name}", link) for name, link in links[:2]]),
-        row(button("Обновить", f"xr:link:{inbound.id}"), button("Инбаунд", f"xr:in:{inbound.id}")),
-        back_row(),
+        row(*[copy_button(t("XR_LINKS_COPY", name=name), link) for name, link in links[:2]]),
+        row(button(t("UI_REFRESH"), f"xr:link:{inbound.id}"), button(t("XR_BTN_INBOUND"), f"xr:in:{inbound.id}")),
+        back_row("xr:home"),
     ]
-    return screen("Ссылки инбаунда", inbound.remark, blocks, buttons)
+    return screen(t("XR_LINKS_TITLE"), inbound.remark, blocks, buttons)
 
-def client_screen(view: XrayView, inbound: XrayInbound, client_email: str, link: str) -> Any:
-    client = inbound.client(client_email)
-    blocks = banner(view)
+
+def client_screen(view: XrayView, inbound: XrayInbound, email: str, link: str, sub_url: str = "", sub_path: str = "") -> Any:
+    t = view.tr()
+    client = inbound.client(email)
+    blocks = banner(view, t)
     if client is None:
-        blocks.append(quote(bold("клиент не найден")))
-        return screen("Клиент", client_email, blocks, [back_row(f"xr:in:{inbound.id}")])
-    pairs = [("имя", code(client.email)), ("включен", code("да" if client.enable else "нет"))]
-    if client.ident:
-        pairs.append(("идентификатор", code(client.ident)))
-    if client.password:
-        pairs.append(("пароль", code(client.password)))
-    if client.flow:
-        pairs.append(("flow", code(client.flow)))
-    blocks.append(table(pairs, ("поле", "значение")))
+        blocks.append(quote(bold(t("XR_CLIENT_MISSING"))))
+        return screen(t("XR_CLIENT_TITLE"), email, blocks, [back_row(f"xr:in:{inbound.id}")])
+    pairs = [
+        (t("XR_CLIENT_NAME"), code(client.email)),
+        (t("XR_CLIENT_ENABLED"), code(i18n.t("UI_YES" if client.enable else "UI_NO", view.lang))),
+        (t("XR_CLIENT_ID"), code(client.ident)),
+        (t("XR_CLIENT_FLOW"), code(client.flow or t("UI_NONE"))),
+        (t("XR_CLIENT_LIMIT"), code(client.limit_ip)),
+        (t("XR_CLIENT_TRAFFIC"), code(client.total_gb)),
+    ]
+    if sub_path:
+        pairs.append((t("XR_CLIENT_SUB_PATH"), code(sub_path)))
+    blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
     if link:
         blocks.append(pre(link))
+    if sub_url:
+        blocks.append(f"<p>{t('XR_CLIENT_SUB_URL', url=code(sub_url))}</p>")
     buttons = [
-        row(copy_button("копировать ссылку", link)) if link else "",
-        row(button("Удалить клиента", f"xr:cldel:{inbound.id}:{client.email}"), button("Инбаунд", f"xr:in:{inbound.id}")),
-        back_row(),
+        row(copy_button(t("XR_CLIENT_COPY"), link)) if link else "",
+        row(button(t("XR_CLIENT_SUB"), f"xr:sub:{inbound.id}:{client.email}"), button(t("XR_CLIENT_NEW_PATH"), f"xr:subrot:{inbound.id}:{client.email}")),
+        row(button(t("XR_CLIENT_FLOW_BTN"), f"xr:clflow:{inbound.id}:{client.email}"), button(t("XR_CLIENT_LIMIT_BTN"), f"xr:cllimit:{inbound.id}:{client.email}")),
+        row(button(t("UI_DELETE_CLIENT"), f"xr:cldel:{inbound.id}:{client.email}"), button(t("XR_BTN_INBOUND"), f"xr:in:{inbound.id}")),
+        back_row("xr:home"),
     ]
-    return screen("Клиент", f"{inbound.remark} / {client.email}", blocks, buttons)
+    return screen(t("XR_CLIENT_TITLE"), f"{inbound.remark} / {client.email}", blocks, buttons)
+
+
+def mldsa_screen(view: XrayView, inbound: XrayInbound) -> Any:
+    t = view.tr()
+    blocks = banner(view, t)
+    pairs = [
+        (t("XR_MLDSA_SECURITY"), code(inbound.security)),
+        (t("XR_MLDSA_SEED_SET"), code(i18n.t("UI_YES" if inbound.mldsa65_seed else "UI_NO", view.lang))),
+        (t("XR_MLDSA_VERIFY"), code(inbound.mldsa65_verify[:24] + "..." if inbound.mldsa65_verify else t("UI_NONE"))),
+        (t("XR_MLDSA_CHAIN"), code(t("XR_MLDSA_CHAIN_VALUE"))),
+    ]
+    blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
+    blocks.append(quote(muted(t("XR_MLDSA_NOTE"))))
+    buttons = [
+        row(
+            inline_button(t("XR_MLDSA_SEED"), inline_prefill("xr_mldsa65_seed", str(inbound.id))),
+            inline_button(t("XR_MLDSA_VERIFY_BTN"), inline_prefill("xr_mldsa65_verify", str(inbound.id))),
+        ),
+        row(button(t("UI_GENERATE"), f"xr:mldsa:{inbound.id}:gen"), button(t("UI_REMOVE"), f"xr:mldsa:{inbound.id}:clear")),
+        back_row(f"xr:in:{inbound.id}"),
+    ]
+    return screen(t("XR_MLDSA_TITLE"), inbound.remark, blocks, buttons)
+
+
+def subs_screen(view: XrayView, rows_data: list[tuple[str, str, str]]) -> Any:
+    t = view.tr()
+    state = view.state
+    blocks = banner(view, t)
+    pairs = [
+        (t("XR_SUBS_ENABLED"), code(i18n.t("UI_YES" if state.sub_enabled else "UI_NO", view.lang))),
+        (t("XR_SUBS_PORT"), code(state.sub_port)),
+        (t("XR_SUBS_ADDRESS"), code(state.sub_address or t("UI_NOT_SET"))),
+        (t("XR_SUBS_FORMAT"), code(state.sub_path_pattern())),
+        (t("SET_SUB_REFRESH"), code(state.sub_refresh)),
+    ]
+    blocks.append(table(pairs, (t("UI_PARAM"), t("UI_VALUE"))))
+    if rows_data:
+        blocks.append(table([(item[0], item[1]) for item in rows_data[:8]], (t("XR_SUBS_TABLE_CLIENT"), t("XR_SUBS_TABLE_PATH"))))
+        blocks.append(pre("\n".join(item[2] for item in rows_data[:3] if item[2])))
+    else:
+        blocks.append(quote(muted(t("XR_SUBS_EMPTY"))))
+    blocks.append(quote(muted(t("XR_SUBS_NOTE", length=SUB_SEGMENT_LEN))))
+    buttons = [
+        row(button(t("XR_SUBS_APPLY"), "xr:subs:apply"), button(t("XR_SUBS_STATUS"), "xr:subs:status")),
+        row(button(t("XR_SUBS_STOP"), "xr:subs:stop"), button(t("XR_SUBS_ROTATE"), "xr:subs:rotate")),
+        row(inline_button(t("XR_SUBS_PORT"), inline_prefill("xr_sub_port")), inline_button(t("XR_SUBS_ADDRESS"), inline_prefill("xr_sub_address"))),
+        row(inline_button(t("SET_SUB_REFRESH"), inline_prefill("xr_sub_refresh"))),
+        back_row("xr:home"),
+    ]
+    return screen(t("XR_SUBS_TITLE"), t("XR_SUBS_SUBTITLE"), blocks, buttons)
+
 
 def core_screen(view: XrayView) -> Any:
-    blocks = banner(view)
+    t = view.tr()
+    blocks = banner(view, t)
     core = view.core
     if core:
         pairs = [
-            ("установлено", code("да" if core.get("installed") else "нет")),
-            ("версия", code(core.get("version", "") or "нет")),
-            ("закреплено", code(core.get("pinned", "") or "")),
-            ("служба", code(core.get("service", "") or "нет")),
-            ("systemd", code("да" if core.get("systemd") else "нет")),
-            ("архитектура", code(core.get("arch", "") or "")),
-            ("файл ядра", code(core.get("core_path", "") or "")),
-            ("конфигурация", code(core.get("config_path", "") or "")),
-            ("инбаундов в файле", code(core.get("inbounds", 0))),
-            ("порты", code(", ".join(str(item) for item in core.get("ports") or []) or "нет")),
-            ("слушают", code(", ".join(str(item) for item in core.get("listening") or []) or "нет")),
+            (t("XR_CORE_INSTALLED"), code(i18n.t("UI_YES" if core.get("installed") else "UI_NO", view.lang))),
+            (t("XR_CORE_VERSION"), code(core.get("version", "") or t("UI_NONE"))),
+            (t("XR_CORE_PINNED"), code(core.get("pinned", "") or "")),
+            (t("XR_CORE_SERVICE"), code(core.get("service", "") or t("UI_NONE"))),
+            (t("XR_CORE_SYSTEMD"), code(i18n.t("UI_YES" if core.get("systemd") else "UI_NO", view.lang))),
+            (t("XR_CORE_ARCH"), code(core.get("arch", "") or "")),
+            (t("XR_CORE_BINARY"), code(core.get("core_path", "") or "")),
+            (t("XR_CORE_CONFIG"), code(core.get("config_path", "") or "")),
+            (t("XR_CORE_INBOUNDS"), code(core.get("inbounds", 0))),
+            (t("XR_CORE_PORTS"), code(", ".join(str(item) for item in core.get("ports") or []) or t("UI_NONE"))),
+            (t("XR_CORE_LISTENING"), code(", ".join(str(item) for item in core.get("listening") or []) or t("UI_NONE"))),
         ]
-        blocks.append(table(pairs, ("параметр", "значение")))
-        if core.get("config_digest"):
-            blocks.append(f"<p>хеш конфигурации {code(str(core['config_digest'])[:24])}</p>")
+        blocks.append(table(pairs, (t("UI_PARAM"), t("UI_VALUE"))))
     else:
-        blocks.append(quote(muted("состояние ядра не читано")))
+        blocks.append(quote(muted(t("XR_CORE_UNKNOWN"))))
     buttons = [
-        row(button("Установить или обновить", "xr:core:install"), button("Применить конфигурацию", "xr:core:apply")),
-        row(button("Перезапустить", "xr:core:restart"), button("Остановить", "xr:core:stop")),
-        row(button("Удалить ядро", "xr:core:purge"), button("Обновить", "xr:check")),
-        version_row(view.state.version),
-        row(inline_button("уровень логов", inline.prefill("xr_log_level"))),
-        back_row(),
+        row(button(t("XR_CORE_INSTALL"), "xr:core:install"), button(t("XR_CORE_APPLY"), "xr:core:apply")),
+        row(button(t("XR_CORE_RESTART"), "xr:core:restart"), button(t("XR_CORE_STOP"), "xr:core:stop")),
+        row(button(t("XR_CORE_PURGE"), "xr:core:purge"), button(t("UI_REFRESH"), "xr:check")),
+        version_row(view.state.version, view.lang, view.state.pinned()),
+        back_row("xr:home"),
     ]
-    return screen("Ядро Xray", "установка и служба", blocks, buttons)
+    return screen(t("XR_CORE_TITLE"), t("XR_CORE_SUBTITLE"), blocks, buttons)
 
 
-def version_row(current: str) -> str:
-    mark_latest = "версия latest" if current.lower() != "latest" else "latest выбрана"
-    mark_pin = "версия " + XRAY_VERSION if current.lower() == "latest" else XRAY_VERSION + " выбрана"
+def version_row(current: str = "", lang: str = i18n.DEFAULT_LANGUAGE, pinned: str = "") -> str:
+    t = i18n.translator(lang)
     return row(
-        button(mark_latest if current.lower() != "latest" else "latest", "xr:core:ver:latest"),
-        button(mark_pin if current.lower() == "latest" else XRAY_VERSION, "xr:core:ver:" + XRAY_VERSION),
+        button(t("XR_VERSION_LATEST"), "xr:core:ver:latest"),
+        button(t("XR_VERSION_PINNED", version=pinned), "xr:core:ver:pin"),
     )
 
+
 def scan_screen(view: XrayView, results: list[ScanResult] | None = None) -> Any:
+    t = view.tr()
     state = view.state
-    blocks = banner(view)
+    blocks = banner(view, t)
     rows = results if results is not None else [ScanResult.from_dict(item) for item in state.scan_results]
-    blocks.append(f"<p>целей в списке {code(len(state.scan_targets))}</p>")
-    blocks.append(pre("\n".join(state.scan_targets) or "нет"))
+    blocks.append(f"<p>{t('XR_SCAN_TARGETS', count=code(len(state.scan_targets)))}</p>")
+    blocks.append(f"<p>{muted(t('XR_SCAN_PROBE', sni=code(state.scan_sni or t('UI_NONE')), xver=code(state.scan_xver)))}</p>")
+    blocks.append(pre("\n".join(state.scan_targets[:12]) or t("UI_NONE")))
     if rows:
         pairs = []
         for item in rows[:10]:
-            mark = "годен" if item.feasible else "не годен"
+            mark = t("XR_SCAN_FEASIBLE") if item.feasible else t("XR_SCAN_INFEASIBLE")
             name = (item.server_names[0] if item.server_names else "") or item.host or item.target
-            pairs.append((item.target, f"{mark}, {item.latency_ms} ms, {name}"))
-        blocks.append(table(pairs, ("цель", "итог")))
+            group = item.pq_group or t("XR_SCAN_NO_PQ")
+            pairs.append((item.target, t("XR_SCAN_ROW", mark=mark, latency=item.latency_ms, group=group, name=name)))
+        blocks.append(table(pairs, (t("XR_SCAN_TARGET"), t("XR_SCAN_RESULT"))))
         best = next((item for item in rows if item.feasible), None)
         if best is not None:
-            blocks.append(quote(muted(f"лучший кандидат {best.target}, задержка {best.latency_ms} ms")))
+            blocks.append(quote(muted(t("XR_SCAN_BEST", target=best.target, latency=best.latency_ms))))
     else:
-        blocks.append(quote(muted("сканирование еще не запускалось")))
+        blocks.append(quote(muted(t("XR_SCAN_EMPTY"))))
     buttons = [
-        row(button("Сканировать", "xr:scan:run"), button("Мои цели", "xr:scan:targets")),
-        row(inline_button("своя цель", inline.prefill("xr_scan_manual")), button("Сброс к умолчанию", "xr:scan:reset")),
+        row(button(t("XR_SCAN_RUN"), "xr:scan:run"), button(t("XR_SCAN_MY_TARGETS"), "xr:scan:targets")),
+        row(inline_button(t("XR_SCAN_OWN_TARGET"), inline_prefill("xr_scan_manual")), button(t("XR_SCAN_RESET"), "xr:scan:reset")),
+        row(inline_button(t("SET_SCAN_SNI"), inline_prefill("xr_scan_sni")), inline_button(t("SET_SCAN_XVER"), inline_prefill("xr_scan_xver"))),
     ]
     if rows:
-        buttons.insert(
-            1,
-            row(*[button(f"взять {item.target}", f"xr:scan:use:{index}") for index, item in enumerate(rows[:3])]),
-        )
-    buttons.append(back_row())
-    return screen("Сканер Reality", "tls 1.3, h2, x25519, годный сертификат", blocks, buttons)
+        buttons.insert(1, row(*[button(t("XR_SCAN_USE", target=item.target), f"xr:scan:use:{index}") for index, item in enumerate(rows[:3])]))
+    buttons.append(back_row("xr:home"))
+    return screen(t("XR_SCAN_TITLE"), t("XR_SCAN_SUBTITLE"), blocks, buttons)
+
 
 def scan_targets_screen(view: XrayView) -> Any:
-    blocks = banner(view)
-    blocks.append(quote(muted("список целей можно изменить одной строкой через запятую")))
-    blocks.append(pre("\n".join(view.state.scan_targets) or "нет"))
+    t = view.tr()
+    blocks = banner(view, t)
+    blocks.append(quote(muted(t("XR_TARGETS_NOTE"))))
+    blocks.append(pre("\n".join(view.state.scan_targets) or t("UI_NONE")))
+    blocks.append(f"<p>{t('XR_TARGETS_CANDIDATES', count=code(len(view.state.candidates())))}</p>")
+    blocks.append(pre("\n".join(view.state.candidates()[:12])))
     buttons = [
-        row(inline_button("изменить список", inline.prefill("xr_scan_targets"))),
-        row(button("К умолчанию", "xr:scan:reset"), button("Сканер", "xr:scan")),
-        back_row(),
+        row(inline_button(t("XR_TARGETS_EDIT"), inline_prefill("xr_scan_targets"))),
+        row(inline_button(t("XR_TARGETS_EDIT_CANDIDATES"), inline_prefill("xr_scan_candidates"))),
+        row(button(t("XR_TARGETS_DEFAULT"), "xr:scan:reset"), button(t("NAV_SCANNER"), "xr:scan")),
+        back_row("xr:home"),
     ]
-    return screen("Цели сканирования", "host:port или подсеть", blocks, buttons)
+    return screen(t("XR_TARGETS_TITLE"), t("XR_TARGETS_SUBTITLE"), blocks, buttons)
+
 
 def input_screen(view: XrayView, ident: str, ctx: str = "", back: str = "xr:home") -> Any:
-    from . import inline as input_fields
+    from . import inline
 
-    item = input_fields.field(ident)
-    blocks = banner(view)
-    blocks.append(table([("поле", code(item.label)), ("подсказка", muted(item.hint))], ("поле", "значение")))
+    t = view.tr()
+    item = inline.field(ident)
+    blocks = banner(view, t)
+    blocks.append(table([(t("UI_FIELD"), code(item.label(view.lang))), (t("UI_HINT"), muted(item.hint(view.lang)))], (t("UI_FIELD"), t("UI_VALUE"))))
     if item.example:
-        blocks.append(f"<p>пример {code(item.example)}</p>")
-    blocks.append(quote(muted("нажмите кнопку ввода, наберите значение в строке запроса и выберите результат")))
+        blocks.append(f"<p>{t('PROMPT_EXAMPLE', example=code(item.example))}</p>")
+    blocks.append(quote(muted(t("XR_INPUT_NOTE"))))
     buttons = [
-        row(inline_button("ввести значение", input_fields.prefill(ident, ctx or "-"))),
-        row(button("Назад", back), button("Xray", "xr:home")),
+        row(inline_button(t("PROMPT_INPUT"), inline.prefill(ident, ctx or "-"))),
+        row(button(t("UI_BACK"), back), button(t("NAV_XRAY"), "xr:home")),
     ]
-    return screen("Ввод значения", item.label, blocks, buttons)
+    return screen(t("PROMPT_TITLE"), item.label(view.lang), blocks, buttons)
 
 
 def confirm_screen(view: XrayView, title: str, body: str, action: str, back: str = "xr:home") -> Any:
-    blocks = banner(view)
+    t = view.tr()
+    blocks = banner(view, t)
     blocks.append(quote(bold(body)))
-    buttons = [row(button("Подтвердить", action), button("Отмена", back))]
-    return screen(title, "действие необратимо", blocks, buttons)
+    buttons = [row(button(t("UI_CONFIRM"), action), button(t("UI_CANCEL"), back))]
+    return screen(title, t("UI_ACTION_IRREVERSIBLE"), blocks, buttons)
+
 
 def logs_screen(view: XrayView, lines: list[str], tail: int) -> Any:
-    blocks = banner(view)
-    blocks.append(f"<p>последние {code(tail)} строк</p>")
-    blocks.append(pre("\n".join(lines) or "пусто"))
+    t = view.tr()
+    blocks = banner(view, t)
+    blocks.append(f"<p>{t('LOGS_LAST', count=code(tail))}</p>")
+    blocks.append(pre("\n".join(lines) or t("UI_EMPTY")))
     buttons = [
         row(button("50", "xr:logs:50"), button("200", "xr:logs:200"), button("500", "xr:logs:500")),
-        row(button("Обновить", f"xr:logs:{tail}"), button("Ядро", "xr:core")),
-        back_row(),
+        row(button(t("UI_REFRESH"), f"xr:logs:{tail}"), button(t("NAV_CORE"), "xr:core")),
+        back_row("xr:home"),
     ]
-    return screen("Логи Xray", "journal или файл состояния", blocks, buttons)
+    return screen(t("XR_LOGS_TITLE"), t("XR_LOGS_SUBTITLE"), blocks, buttons)
 
-def busy_screen(title: str, steps: list[str] | None = None) -> Any:
+
+def busy_screen(title: str, lang: str = i18n.DEFAULT_LANGUAGE, steps: list[str] | None = None) -> Any:
+    t = i18n.translator(lang)
     blocks = [quote(muted(title))]
     if steps:
         blocks.append(bullet_list([muted(item) for item in steps]))
-    return screen("Xray", "выполняется", blocks, [])
+    return screen(t("XR_TITLE"), t("BUSY_SUBTITLE"), blocks, [])
+
 
 def default_targets() -> list[str]:
-    return list(SCAN_DEFAULTS)
+    from .scan import DEFAULT_CANDIDATES
 
-def key_row(inbound: XrayInbound) -> str:
-    return row(
-        copy_button("копировать public key", inbound.public_key or ""),
-        copy_button("копировать short id", (inbound.short_ids or [""])[0]),
-    )
+    return list(DEFAULT_CANDIDATES)
+
 
 def stat_line(inbound: XrayInbound) -> str:
     return f"{inbound.protocol} {inbound.port} {inbound.network} {inbound.security}"
 
-def links_hint(inbound: XrayInbound) -> str:
-    return divider() + f"<p>{muted('ссылки собираются по правилам 3x-ui')}</p>"
 
-def summary_pairs(inbound: XrayInbound) -> list[tuple[str, str]]:
-    return summary(inbound)
-
-def mask_host(host: str) -> str:
-    if not host:
-        return "не задан"
-    parts = host.split(".")
-    if len(parts) == 4:
-        return ".".join(parts[:2] + ["*", "*"])
-    return host
-
-def target_pairs(results: list[ScanResult]) -> list[tuple[str, str]]:
-    return [(item.target, f"{item.latency_ms} ms") for item in results[:10]]
-
-def xray_button_row() -> str:
-    return row(button("Xray", "nav:xray"), button("Сканер", "xr:scan"))
-
-def apply_hint(state: XrayState) -> str:
-    if not state.inbounds:
-        return muted("нет инбаундов, применять нечего")
-    return muted(f"инбаундов к записи: {len(state.enabled())}")
-
-def top_row() -> str:
-    return big("Xray панель", "nav:xray")
+def fingerprint_note(lang: str) -> str:
+    return divider() + "<p>" + i18n.t("XR_FINGERPRINTS", lang, values=", ".join(FINGERPRINTS)) + "</p>"

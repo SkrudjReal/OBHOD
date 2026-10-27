@@ -89,8 +89,29 @@ env_get() {
   awk -F= -v k="$key" '$1==k { sub(/^[^=]*=/, ""); print; exit }' "$ENV_FILE"
 }
 
+check_credential() {
+  local name="$1" value="$2"
+  case "$value" in
+    *[![:print:]]*) die "$name must not contain control characters or newlines" ;;
+  esac
+  case "$value" in
+    *=*) die "$name must not contain an equals sign" ;;
+  esac
+  [ "${#value}" -le 200 ] || die "$name is too long"
+}
+
 write_env() {
   local token="$1" api_id="$2" api_hash="$3" admin_id="$4"
+  check_credential BOT_TOKEN "$token"
+  check_credential API_ID "$api_id"
+  check_credential API_HASH "$api_hash"
+  check_credential ADMIN_ID "$admin_id"
+  case "$api_id" in
+    *[!0-9]*) die "api_id must be a number" ;;
+  esac
+  case "$admin_id" in
+    *[!0-9]*) die "admin id must be a number" ;;
+  esac
   mkdir -p "$CONF_DIR"
   chmod 700 "$CONF_DIR"
   umask 077
@@ -100,7 +121,6 @@ API_ID=$api_id
 API_HASH=$api_hash
 ADMIN_ID=$admin_id
 OBHOD_STATE_DIR=$STATE_DIR
-OBHOD_INSTALL_SCRIPT=$PREFIX/Storage/install.sh
 OBHOD_LOG_LEVEL=INFO
 EOF
   chmod 600 "$ENV_FILE"
@@ -122,12 +142,12 @@ install_payload() {
   mkdir -p "$PREFIX"
   rm -rf "$PREFIX/BOT" "$PREFIX/Storage"
   cp -a "$PAYLOAD_DIR/BOT" "$PREFIX/BOT"
-  mkdir -p "$PREFIX/Storage"
-  cp -a "$PAYLOAD_DIR/Storage/install.sh" "$PREFIX/Storage/install.sh"
+  mkdir -p "$PREFIX/Storage/remote"
+  cp -a "$PAYLOAD_DIR/Storage/remote/." "$PREFIX/Storage/remote/"
   if [ -f "$PAYLOAD_DIR/requirements.txt" ]; then
     cp -a "$PAYLOAD_DIR/requirements.txt" "$PREFIX/requirements.txt"
   fi
-  chmod 755 "$PREFIX/Storage/install.sh"
+  chmod -R go-w "$PREFIX/Storage/remote"
   chmod -R go-w "$PREFIX/BOT"
   find "$PREFIX/BOT" -name '__pycache__' -type d -prune -exec rm -rf {} +
 }
@@ -167,6 +187,10 @@ cmd_install() {
   check_python
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
+  if [ "$DEV" = "0" ]; then
+    mkdir -p "${LOG_DIR:-/var/log/obhod}"
+    chmod 700 "${LOG_DIR:-/var/log/obhod}"
+  fi
   local token api_id api_hash admin_id
   token="$(env_get BOT_TOKEN)"
   api_id="$(env_get API_ID)"

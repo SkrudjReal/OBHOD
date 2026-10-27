@@ -72,13 +72,13 @@ def test_help_text() -> None:
 def test_dev_install_and_uninstall(tmp_path: Path) -> None:
     home = tmp_path / "home"
     payload = tmp_path / "payload"
-    (payload / "Storage").mkdir(parents=True)
+    (payload / "Storage" / "remote").mkdir(parents=True)
     (payload / "BOT").mkdir(parents=True)
     (payload / "BOT" / "__init__.py").write_text("SENTINEL = 1\n")
     (payload / "requirements.txt").write_text("")
     shutil.copy(INSTALLER, payload / "Storage" / "obhod-install.sh")
-    shutil.copy(ROOT / "Storage" / "install.sh", payload / "Storage" / "install.sh")
     shutil.copy(UNIT, payload / "Storage" / "obhod.service")
+    shutil.copy(ROOT / "Storage" / "remote" / "xray_agent.py", payload / "Storage" / "remote" / "xray_agent.py")
     env_conf = home / ".obhod" / "etc" / "obhod.env"
     env_conf.parent.mkdir(parents=True)
     env_conf.write_text(f"BOT_TOKEN=123456:ABC\nAPI_ID=42\nAPI_HASH={HASH}\nADMIN_ID=1000\n")
@@ -95,7 +95,7 @@ def test_dev_install_and_uninstall(tmp_path: Path) -> None:
     assert "installed" in install.stdout
     prefix = home / ".obhod" / "app"
     assert (prefix / "BOT" / "__init__.py").is_file()
-    assert (prefix / "Storage" / "install.sh").is_file()
+    assert (prefix / "Storage" / "remote" / "xray_agent.py").is_file()
     assert os.stat(env_conf).st_mode & 0o777 == 0o600
     assert os.stat(home / ".obhod" / "etc").st_mode & 0o777 == 0o700
     assert os.stat(home / ".obhod" / "state").st_mode & 0o777 == 0o700
@@ -160,13 +160,13 @@ def test_dev_install_rejects_bad_api_hash(tmp_path: Path) -> None:
 def dev_payload(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
     home = tmp_path / "home"
     payload = tmp_path / "payload"
-    (payload / "Storage").mkdir(parents=True)
+    (payload / "Storage" / "remote").mkdir(parents=True)
     (payload / "BOT").mkdir(parents=True)
     (payload / "BOT" / "__init__.py").write_text("SENTINEL = 1\n")
     (payload / "requirements.txt").write_text("")
     shutil.copy(INSTALLER, payload / "Storage" / "obhod-install.sh")
-    shutil.copy(ROOT / "Storage" / "install.sh", payload / "Storage" / "install.sh")
     shutil.copy(UNIT, payload / "Storage" / "obhod.service")
+    shutil.copy(ROOT / "Storage" / "remote" / "xray_agent.py", payload / "Storage" / "remote" / "xray_agent.py")
     env_conf = home / ".obhod" / "etc" / "obhod.env"
     env_conf.parent.mkdir(parents=True, exist_ok=True)
     env_conf.write_text(f"BOT_TOKEN=123456:ABC\nAPI_ID=42\nAPI_HASH={HASH}\nADMIN_ID=1000\n")

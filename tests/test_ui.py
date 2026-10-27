@@ -43,10 +43,10 @@ def test_esc_and_helpers() -> None:
 
 
 def test_button_html_shape() -> None:
-    html = button("Меню", "nav:home").html()
+    html = button("Menu", "nav:home").html()
     assert html.startswith('<tg-button type="callback_data"')
     assert 'data="nav:home"' in html
-    assert html.endswith(">Меню</tg-button>")
+    assert html.endswith(">Menu</tg-button>")
 
 
 def test_button_rejects_long_callback() -> None:
@@ -55,7 +55,7 @@ def test_button_rejects_long_callback() -> None:
 
 
 def test_copy_button_is_text_type() -> None:
-    html = copy_button("Копировать", "freeturn://abc")
+    html = copy_button("Copy", "freeturn://abc")
     assert 'type="copy_text"' in html
     assert 'text="freeturn://abc"' in html
 
@@ -68,7 +68,7 @@ def test_row_wraps_buttons() -> None:
 
 
 def test_big_is_single_button_row() -> None:
-    html = big("Применить", "srv:apply", "success")
+    html = big("Apply", "srv:apply", "success")
     assert count_buttons(html) == 1
     assert 'style="success"' in html
     assert html.count("<tg-button-row") == 1
@@ -92,11 +92,11 @@ def test_lists_details_quote_pre() -> None:
 
 
 def test_screen_returns_rich_with_buttons() -> None:
-    rich = screen("Заголовок", "подзаголовок", ["<p>x</p>"], [big("a", "nav:home")], footer=muted("f"))
+    rich = screen("Title", "subtitle", ["<p>x</p>"], [big("a", "nav:home")], footer=muted("f"))
     assert isinstance(rich, Rich)
     html = rich.build()
-    assert html.startswith("<h2>Заголовок</h2>")
-    assert "подзаголовок" in html
+    assert html.startswith("<h2>Title</h2>")
+    assert "subtitle" in html
     assert "<hr/>" in html
     assert count_buttons(html) == 1
     assert html.rstrip().endswith("</footer>")

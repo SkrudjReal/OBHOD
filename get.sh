@@ -15,6 +15,21 @@ say() { printf '%s\n' "$*" ; }
 note() { printf '%s\n' "$*" >&2 ; }
 die() { printf 'error: %s\n' "$*" >&2 ; exit 1 ; }
 
+check_dest() {
+  case "$DEST" in
+    /*) ;;
+    *) die "OBHOD_DIR must be an absolute path" ;;
+  esac
+  case "$DEST" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|\\.|\\.\\.)
+      die "OBHOD_DIR must point at a directory of its own, not $DEST" ;;
+  esac
+  case "$DEST" in
+    */../*|*/..) die "OBHOD_DIR must not contain .." ;;
+  esac
+  return 0
+}
+
 cleanup() {
   if [ -n "$WORK" ] && [ -d "$WORK" ]; then
     rm -rf "$WORK"
@@ -41,7 +56,7 @@ if [ "${#ARGS[@]}" -eq 0 ]; then
 fi
 
 if [ "$(id -u)" != "0" ]; then
-  die "установка возможна только от root, запустите curl ... | sudo bash"
+  die "the install is possible only from root, run curl ... | sudo bash"
 fi
 
 CREDS=0
@@ -74,19 +89,19 @@ need_tools() {
   if command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
     return 0
   fi
-  die "нужен git, либо curl и tar, поставьте их и повторите"
+  die "git is needed, or curl and tar, install them and repeat"
 }
 
 fetch_source() {
   if [ -n "$SRC_DIR" ]; then
-    [ -f "$SRC_DIR/Storage/obhod-install.sh" ] || die "в $SRC_DIR нет Storage/obhod-install.sh"
-    say "источник: $SRC_DIR"
+    [ -f "$SRC_DIR/Storage/obhod-install.sh" ] || die "there is no Storage/obhod-install.sh in $SRC_DIR"
+    say "source: $SRC_DIR"
     SRC="$SRC_DIR"
     return 0
   fi
   WORK="$(mktemp -d)"
   if command -v git >/dev/null 2>&1; then
-    say "клонирование https://github.com/$REPO.git"
+    say "cloning https://github.com/$REPO.git"
     if [ -n "$REF" ]; then
       git clone --depth 1 --branch "$REF" "https://github.com/$REPO.git" "$WORK/repo" >&2
     else
@@ -95,9 +110,14 @@ fetch_source() {
     SRC="$WORK/repo"
     return 0
   fi
-  say "git не найден, скачивание архива ветки ${REF:-по умолчанию}"
+  say "git is missing, downloading the branch archive ${REF:-default}"
   mkdir -p "$WORK/repo"
   curl -fsSL "https://codeload.github.com/$REPO/tar.gz/${REF:-HEAD}" -o "$WORK/repo.tar.gz"
+  if [ -n "${OBHOD_SHA256:-}" ]; then
+    actual="$(sha256sum "$WORK/repo.tar.gz" | cut -d' ' -f1)"
+    [ "$actual" = "$OBHOD_SHA256" ] || die "the source archive digest does not match"
+    say "source digest matches"
+  fi
   tar -xzf "$WORK/repo.tar.gz" --strip-components=1 -C "$WORK/repo"
   SRC="$WORK/repo"
 }
@@ -125,46 +145,47 @@ write_env_file() {
   chmod 600 "$path"
 }
 
+check_dest
 need_tools
-say "репозиторий: $REPO"
-say "ветка: ${REF:-по умолчанию}"
-say "каталог: $DEST"
+say "repository: $REPO"
+say "branch: ${REF:-default}"
+say "directory: $DEST"
 
 if [ "$DRY_RUN" = "1" ]; then
   if [ -n "$SRC_DIR" ]; then
-    say "источник: $SRC_DIR"
+    say "source: $SRC_DIR"
   elif command -v git >/dev/null 2>&1; then
-    say "шаг: git clone --depth 1 https://github.com/$REPO.git"
+    say "step: git clone --depth 1 https://github.com/$REPO.git"
   else
-    say "шаг: curl https://codeload.github.com/$REPO/tar.gz/${REF:-HEAD} и tar -xzf"
+    say "step: curl https://codeload.github.com/$REPO/tar.gz/${REF:-HEAD} and tar -xzf"
   fi
-  say "шаг: синхронизация файлов в $DEST"
+  say "step: syncing the files into $DEST"
   if [ "$CREDS" = "1" ]; then
-    say "учетные данные: из переменных окружения"
+    say "credentials: from the environment"
   else
-    say "учетные данные: спрашиваются в терминале"
+    say "credentials: asked in the terminal"
   fi
   if [ -n "$ENV_PATH" ]; then
     if [ "$CREDS" = "1" ]; then
       write_env_file "$ENV_PATH"
-      say "env-файл: $ENV_PATH"
+      say "env file: $ENV_PATH"
     fi
   fi
-  say "команда: bash $DEST/Storage/obhod-install.sh ${ARGS[*]}"
+  say "command: bash $DEST/Storage/obhod-install.sh ${ARGS[*]}"
   exit 0
 fi
 
 if [ "$NO_INSTALL" = "0" ] && [ "$CREDS" = "0" ] && ! tty_available; then
-  die "нет терминала для ввода, передайте BOT_TOKEN API_ID API_HASH ADMIN_ID переменными окружения"
+  die "there is no terminal for the input, pass BOT_TOKEN API_ID API_HASH ADMIN_ID through the environment"
 fi
 
 fetch_source
-[ -f "$SRC/Storage/obhod-install.sh" ] || die "в источнике нет Storage/obhod-install.sh"
+[ -f "$SRC/Storage/obhod-install.sh" ] || die "there is no Storage/obhod-install.sh in the source"
 sync_source
-say "файлы обновлены в $DEST"
+say "files updated in $DEST"
 
 if [ "$NO_INSTALL" = "1" ]; then
-  say "установка пропущена, запуск вручную: bash $DEST/Storage/obhod-install.sh ${ARGS[*]}"
+  say "the install is skipped, run it by hand: bash $DEST/Storage/obhod-install.sh ${ARGS[*]}"
   exit 0
 fi
 
@@ -177,12 +198,12 @@ if [ "$CREDS" = "1" ]; then
   write_env_file "$ENV_PATH"
   INSTALL_ARGS+=("--env-file=$ENV_PATH" "--yes")
   unset BOT_TOKEN API_ID API_HASH ADMIN_ID OBHOD_TOKEN OBHOD_API_ID OBHOD_API_HASH OBHOD_ADMIN_ID
-  say "учетные данные: из переменных окружения"
+  say "credentials: from the environment"
 else
-  say "учетные данные: спрашиваются в терминале"
+  say "credentials: asked in the terminal"
 fi
 
-say "запуск установщика"
+say "starting the installer"
 if [ -t 0 ]; then
   bash "$DEST/Storage/obhod-install.sh" "${INSTALL_ARGS[@]}"
 elif tty_available; then
@@ -191,6 +212,6 @@ else
   bash "$DEST/Storage/obhod-install.sh" "${INSTALL_ARGS[@]}" < /dev/null
 fi
 
-say "готово, проверка службы: systemctl status obhod"
-say "обновление потом: повторный запуск этого скрипта с теми же ключами"
-say "исходники на сервере: $DEST"
+say "done, check the service with systemctl status obhod"
+say "to update later run this script again with the same keys"
+say "sources on the server: $DEST"

@@ -70,7 +70,7 @@ def test_script_has_no_comments() -> None:
     for number, line in enumerate(SCRIPT.read_text(encoding="utf-8").splitlines(), start=1):
         stripped = line.strip()
         if stripped.startswith("#"):
-            assert number == 1, f"строка {number}: {stripped}"
+            assert number == 1, f"line {number}: {stripped}"
 
 
 def test_script_syntax() -> None:
@@ -100,25 +100,25 @@ def test_dry_run_reports_git_clone(tmp_path: Path) -> None:
 def test_dry_run_reports_local_source(tmp_path: Path) -> None:
     result = run(tmp_path, "--dry-run", env={"OBHOD_SRC_DIR": str(ROOT)})
     assert result.returncode == 0, result.stderr
-    assert "источник: " + str(ROOT) in result.stdout
+    assert "source: " + str(ROOT) in result.stdout
     assert "git clone" not in result.stdout
 
 
 def test_dry_run_shows_target_directory(tmp_path: Path) -> None:
     target = tmp_path / "src"
     result = run(tmp_path, "--dry-run", f"--dir={target}")
-    assert f"каталог: {target}" in result.stdout
+    assert f"directory: {target}" in result.stdout
     assert f"bash {target}/Storage/obhod-install.sh" in result.stdout
 
 
 def test_dry_run_reports_branch(tmp_path: Path) -> None:
     result = run(tmp_path, "--dry-run", "--ref=v1.2.3")
-    assert "ветка: v1.2.3" in result.stdout
+    assert "branch: v1.2.3" in result.stdout
 
 
 def test_repo_override(tmp_path: Path) -> None:
     result = run(tmp_path, "--dry-run", "--repo=someone/other")
-    assert "код" not in result.stdout
+    assert "credentials:" in result.stdout
     assert "someone/other" in result.stdout
 
 
@@ -155,18 +155,18 @@ def test_env_file_absent_without_credentials(tmp_path: Path) -> None:
     result = run(tmp_path, "--dry-run", f"--env-file={env_path}")
     assert result.returncode == 0, result.stderr
     assert not env_path.exists()
-    assert "спрашиваются в терминале" in result.stdout
+    assert "credentials: asked in the terminal" in result.stdout
 
 
 def test_dry_run_marks_environment_credentials(tmp_path: Path) -> None:
     result = run(tmp_path, "--dry-run", env=creds())
-    assert "из переменных окружения" in result.stdout
+    assert "credentials: from the environment" in result.stdout
 
 
 def test_missing_terminal_without_credentials(tmp_path: Path) -> None:
     result = run(tmp_path)
     assert result.returncode == 1
-    assert "терминала" in result.stderr
+    assert "terminal" in result.stderr
     assert "BOT_TOKEN" in result.stderr
 
 
@@ -281,7 +281,7 @@ def test_missing_tools_is_reported(tmp_path: Path) -> None:
 def test_no_install_prints_manual_command(tmp_path: Path) -> None:
     target = tmp_path / "dest"
     result = run(tmp_path, "--no-install", f"--dir={target}", env={"OBHOD_SRC_DIR": str(ROOT)})
-    assert "установка пропущена" in result.stdout
+    assert "the install is skipped" in result.stdout
     assert f"bash {target}/Storage/obhod-install.sh install" in result.stdout
 
 
@@ -345,3 +345,15 @@ def test_vendored_installer_untouched_by_script() -> None:
 def test_os_environ_not_leaked_into_call() -> None:
     assert "OBHOD_SRC_DIR" in SCRIPT.read_text(encoding="utf-8")
     assert os.sep == "/"
+
+
+@pytest.mark.parametrize("value", ["/", "/etc", "/usr", "/var", "/opt", "relative/path", "/opt/../etc"])
+def test_the_installer_refuses_a_dangerous_target_directory(tmp_path: Path, value: str) -> None:
+    result = run(tmp_path, "--no-install", "--dry-run", env={"OBHOD_DIR": value, "OBHOD_SRC_DIR": str(ROOT)})
+    assert result.returncode != 0
+    assert "OBHOD_DIR" in result.stderr
+
+
+def test_the_installer_accepts_a_directory_of_its_own(tmp_path: Path) -> None:
+    result = run(tmp_path, "--no-install", "--dry-run", env={"OBHOD_DIR": str(tmp_path / "src"), "OBHOD_SRC_DIR": str(ROOT)})
+    assert result.returncode == 0, result.stderr

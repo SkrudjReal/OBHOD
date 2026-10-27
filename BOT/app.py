@@ -1,61 +1,123 @@
 from __future__ import annotations
 
-import base64
+import ipaddress
 import logging
+import socket
+import time
 
 from goygram import GoyGram
 
-from . import screens
+from . import i18n, inline, screens, xscreens
 from .config import Config, ConfigError
-from .control import ControlClient, ControlError, ControlResponse, ResetOutcome
-from . import inline, xscreens
-from .drafts import Draft
-from .flows import Flows
-from .links import LinkError, build_link, link_rows, normalize_conf, parse_link
-from .models import ClientInfo, ProbeResult, ShareInfo
+from .guard import DEFAULT_BANTIME, BanState, GuardClient, SshState
+from .models import ModelError, valid_port
 from .panel import PanelError, XrayPanel
+from .audit import Audit
+from .seclog import SecurityLog
+from .ratelimit import CALLBACK_LIMIT, CLAIM_LIMIT, EXPENSIVE_LIMIT, INLINE_LIMIT, MESSAGE_LIMIT, Limiter
+from .shell import LocalShell, ShellError
 from .store import State, Store
 from .ui import button, code, muted, quote, row, screen
-from . import validate
-from .validate import ValidationError
+from .xrayrpc import XrayControl, XrayError as RpcError
 
 log = logging.getLogger("obhod.app")
 
 DRAFT_ID = 1
-SECRET_FIELDS = {"ssh_password", "ssh_key", "ssh_passphrase", "ssh_sudo"}
+CLAIM_WINDOW = 900.0
+
+
+def public_address() -> str:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return ""
+    try:
+        sock.settimeout(1.0)
+        sock.connect(("198.51.100.1", 53))
+        found = sock.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+    try:
+        parsed = ipaddress.ip_address(found)
+    except ValueError:
+        return ""
+    if parsed.is_loopback or parsed.is_link_local or parsed.is_unspecified or parsed.is_multicast:
+        return ""
+    return str(parsed)
 
 
 class Bot:
-    def __init__(self, cfg: Config, control: ControlClient | None = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        control: XrayControl | None = None,
+        guard: GuardClient | None = None,
+        shell: LocalShell | None = None,
+    ) -> None:
         self.cfg = cfg
         self.store = Store(cfg.state_dir / "state.json")
         self.state: State = self.store.load()
-        self.control = control or ControlClient(cfg)
-        self.xray = XrayPanel(self)
-        self.flows = Flows()
+        self.control = control or XrayControl(shell=shell)
+        self.guard = guard or GuardClient(self.control)
+        self.xray = XrayPanel(self, self.control)
         self.app: GoyGram | None = None
-        self.probe: ProbeResult | None = None
-        self.clients: list[ClientInfo] = []
-        self.share: ShareInfo | None = None
-        self.pending: dict[int, str] = {}
+        self.ban: BanState | None = None
+        self.sshd: SshState | None = None
         self.busy = False
+        self.started_at = time.monotonic()
+        self.limiter = Limiter()
+        self.audit = Audit(sink=SecurityLog())
+        self.message_limit = MESSAGE_LIMIT
+        self.callback_limit = CALLBACK_LIMIT
+        self.expensive_limit = EXPENSIVE_LIMIT
+        self.inline_limit = INLINE_LIMIT
 
     @property
     def admin_id(self) -> int:
         return int(self.cfg.admin_id or self.state.admin_id or 0)
 
-    def view(self, notice: str = "", error: str = "") -> screens.View:
-        return screens.View(
-            state=self.state,
-            probe=self.probe,
-            clients=list(self.clients),
-            share=self.share,
-            notice=notice,
-            error=error,
-        )
+    @property
+    def language(self) -> str:
+        return i18n.normalize(self.state.language)
+
+    def claim_open(self) -> bool:
+        if self.admin_id:
+            return False
+        if self.state.admin_id:
+            return False
+        reached = getattr(self, "started_at", 0.0)
+        if not reached:
+            return False
+        return time.monotonic() - reached <= CLAIM_WINDOW
+
+    def tr(self) -> i18n.Translator:
+        return i18n.translator(self.language)
+
+    def address(self) -> str:
+        return self.state.xray.sub_address or public_address() or "127.0.0.1"
 
     def save(self) -> None:
         self.store.save(self.state)
+
+    def view(self, notice: str = "", error: str = "", busy: str = "") -> screens.View:
+        return screens.View(
+            state=self.state,
+            core=dict(self.xray.core),
+            ban=self.ban,
+            sshd=self.sshd,
+            notice=notice,
+            error=error,
+            busy=busy,
+            lang=self.language,
+        )
+
+    def ban_view(self, notice: str = "", error: str = "") -> screens.View:
+        return self.view(notice=notice, error=error)
+
+    def sshd_view(self, notice: str = "", error: str = "") -> screens.View:
+        return self.view(notice=notice, error=error)
 
     async def boot(self) -> GoyGram:
         app = GoyGram(
@@ -66,7 +128,7 @@ class Bot:
             default_transport="mtproto",
             intake="mtproto",
             app_name="OBHOD",
-            app_version="2.0",
+            app_version="3.0",
             device_model="desktop",
             system_version="linux",
             mt_host=self.cfg.dc_host,
@@ -74,7 +136,7 @@ class Bot:
         )
         app.on_msg(fn=self.on_message)
         app.on_cb(fn=self.on_callback)
-        app.on_cmd("start", "menu", "help", "id")(self.on_command)
+        app.on_cmd("start", "menu", "help", "id", "language")(self.on_command)
         app.on_inline(fn=self.on_inline)
         self.app = app
         return app
@@ -101,48 +163,49 @@ class Bot:
 
     async def toast(self, evt: object, text: str, alert: bool = False) -> None:
         try:
-            await evt.answer(text or "готово", alert=alert)
+            await evt.answer(text or self.tr()("TOAST_DONE"), alert=alert)
         except Exception as exc:
             log.debug("answer failed: %s", exc)
 
-    async def guard(self, evt: object) -> bool:
+    def private_chat(self, evt: object) -> bool:
+        who = int(getattr(evt, "from_id", 0) or 0)
+        chat_id = int(getattr(evt, "chat_id", 0) or 0)
+        return who > 0 and chat_id == who
+
+    def allowed(self, who: int, scope: str = "any", limit: int = 0, window: float = 0.0) -> bool:
+        return self.limiter.allow(str(who), scope=scope, limit=limit, window=window)
+
+    async def guard_admin(self, evt: object) -> bool:
         who = int(getattr(evt, "from_id", 0) or 0)
         if self.admin_id == 0:
-            if who > 0:
+            if who > 0 and self.claim_open() and self.private_chat(evt) and self.allowed(who, "claim", CLAIM_LIMIT, 60.0):
                 self.state.admin_id = who
                 self.save()
                 log.info("admin claimed: %s", who)
-            return True
+                return True
+            chat_id = int(getattr(evt, "chat_id", 0) or 0)
+            await self.send(chat_id, screens.denied(self.language))
+            return False
         if who == self.admin_id:
             return True
         chat_id = int(getattr(evt, "chat_id", 0) or 0)
-        await self.send(chat_id, screens.denied())
+        await self.send(chat_id, screens.denied(self.language))
         return False
-
-    async def on_inline(self, evt: object) -> None:
-        query = str(getattr(evt, "query", "") or "")
-        src = str(getattr(evt, "src", "mt") or "mt")
-        who = int(getattr(evt, "from_id", 0) or 0)
-        results: list[dict] = []
-        if self.admin_id == 0 or who == self.admin_id:
-            current = self.input_values()
-            results = inline.results_for(query, src=src, current=current)
-            if not results:
-                results = inline.results_for(inline.PREFIX, src=src, current=current)
-        try:
-            await evt.answer(results=results, cache_time=0)
-        except Exception as exc:
-            log.warning("inline answer failed: %s", exc)
 
     def input_values(self) -> dict[str, str]:
         state = self.state
         values = {
-            "ssh_host": state.ssh.host,
-            "ssh_port": str(state.ssh.port),
-            "ssh_user": state.ssh.user,
+            "ssh_new_port": str(self.sshd.ports[0] if self.sshd and self.sshd.ports else state.ssh.port),
             "xr_log_level": state.xray.log_level,
             "xr_scan_targets": ", ".join(state.xray.scan_targets),
             "xr_scan_manual": "",
+            "xr_sub_port": str(state.xray.sub_port),
+            "xr_sub_address": state.xray.sub_address,
+            "xr_bantime": str(state.xray.fail2ban_bantime),
+            "xr_ssh_bantime": state.xray.fail2ban_ssh_bantime,
+            "xr_ssh_maxretry": str(state.xray.fail2ban_ssh_maxretry),
+            "xr_ignoreip": state.xray.fail2ban_ignoreip,
+            "xr_ban_ip": "",
         }
         if state.xray.inbounds:
             inbound = state.xray.inbounds[0]
@@ -150,10 +213,30 @@ class Bot:
             values["xr_port"] = str(inbound.port)
             values["xr_sni"] = inbound.sni
             values["xr_dest"] = inbound.dest
+            values["xr_fingerprint"] = inbound.fingerprint
         return values
 
+    async def on_inline(self, evt: object) -> None:
+        query = str(getattr(evt, "query", "") or "")
+        src = str(getattr(evt, "src", "mt") or "mt")
+        who = int(getattr(evt, "from_id", 0) or 0)
+        results: list[dict] = []
+        allowed = who > 0 and who == self.admin_id and self.allowed(who, "inline", self.inline_limit, 60.0)
+        if allowed:
+            current = self.input_values()
+            results = inline.results_for(query, src=src, current=current, lang=self.language)
+            if not results:
+                results = inline.results_for(inline.PREFIX, src=src, current=current, lang=self.language)
+        try:
+            await evt.answer(results=results, cache_time=0)
+        except Exception as exc:
+            log.warning("inline answer failed: %s", exc)
+
     async def on_message(self, evt: object) -> None:
-        if not await self.guard(evt):
+        if not await self.guard_admin(evt):
+            return
+        if not self.allowed(int(getattr(evt, "from_id", 0) or 0), "message", self.message_limit, 60.0):
+            await self.toast(evt, self.tr()("TOAST_RATE"), alert=True)
             return
         text = str(getattr(evt, "text", "") or "")
         parsed = inline.parse_marker(text)
@@ -161,42 +244,38 @@ class Bot:
             await self.on_input(evt, *parsed)
             return
         if self.busy:
-            await self.toast(evt, "дождитесь завершения операции", alert=True)
+            await self.toast(evt, self.tr()("TOAST_BUSY"), alert=True)
             return
         chat_id = int(getattr(evt, "chat_id", 0) or 0)
-        text = text.strip()
-        who = int(getattr(evt, "from_id", 0) or 0)
-        if who in self.pending:
-            await self.accept_text(chat_id, text)
-            return
-        if text.lower().startswith("freeturn://"):
-            await self.do_import(chat_id, text)
-            return
-        if text.startswith("/"):
+        if text.strip().startswith("/"):
             await self.on_command(evt)
             return
-        await self.send(chat_id, screens.home(self.view(notice="выберите действие")))
+        await self.send(chat_id, screens.home(self.view(notice=self.tr()("HOME_NOTICE_PICK"))))
 
     async def on_command(self, evt: object) -> None:
-        if not await self.guard(evt):
+        if not await self.guard_admin(evt):
             return
         chat_id = int(getattr(evt, "chat_id", 0) or 0)
         cmd = str(getattr(evt, "cmd", "") or "").lower()
         text = str(getattr(evt, "text", "") or "")
         if not cmd and text.startswith("/"):
             cmd = text.split()[0][1:].split("@")[0].lower()
+        t = self.tr()
         if cmd == "id":
             who = int(getattr(evt, "from_id", 0) or 0)
             rich = screen(
-                "Идентификатор",
-                "ваш numeric id",
-                [f"<p>{code(who)}</p>", quote(muted("этот id задается в конфигурации как ADMIN_ID"))],
-                [row(button("Главная", "nav:home"))],
+                t("ID_TITLE"),
+                t("ID_SUBTITLE"),
+                [f"<p>{code(who)}</p>", quote(muted(t("ID_NOTE")))],
+                [row(button(t("UI_HOME"), "nav:home"))],
             )
             await self.send(chat_id, rich)
             return
         if cmd == "help":
             await self.send(chat_id, screens.help_screen(self.view()))
+            return
+        if cmd == "language":
+            await self.send(chat_id, screens.language_screen(self.view()))
             return
         await self.send(chat_id, screens.home(self.view()))
 
@@ -205,7 +284,7 @@ class Bot:
         msg_id = int(getattr(evt, "msg_id", 0) or 0)
         await self.drop_marker(chat_id, msg_id)
         if self.busy and ident != inline.CANCEL:
-            await self.toast(evt, "дождитесь завершения операции", alert=True)
+            await self.toast(evt, self.tr()("TOAST_BUSY"), alert=True)
             return
         try:
             if ident == inline.CANCEL:
@@ -215,8 +294,9 @@ class Bot:
                 await self.ssh_input(chat_id, ident, value)
                 return
             await self.xray.apply_input(chat_id, ident, ctx, value)
-        except (PanelError, ValidationError, ConfigError, LinkError) as exc:
-            await self.send(chat_id, screens.error_screen(self.view(), "Ошибка ввода", str(exc)))
+        except (PanelError, ModelError, ConfigError, RpcError, ShellError) as exc:
+            message = getattr(exc, "message", str(exc))
+            await self.send(chat_id, screens.error_screen(self.view(), self.tr()("ERR_INPUT_TITLE"), message))
 
     async def drop_marker(self, chat_id: int, msg_id: int) -> None:
         if not msg_id or self.app is None:
@@ -230,65 +310,45 @@ class Bot:
             log.debug("marker delete failed: %s", exc)
 
     async def ssh_input(self, chat_id: int, ident: str, value: str) -> None:
-        try:
-            notice = self.flows.apply_field(self.state, ident, value)
-        except (ValidationError, ConfigError) as exc:
-            await self.send(chat_id, xscreens.input_screen(xscreens.XrayView(state=self.state, core=dict(self.xray.core), error=str(exc)), ident, "", "nav:ssh"))
+        text = (value or "").strip()
+        if ident == "ssh_new_port":
+            port = valid_port(text)
+            await self.harden(chat_id, port=port)
             return
-        self.save()
-        await self.send(chat_id, screens.ssh_settings(self.view(notice=notice)))
-
-    async def accept_text(self, chat_id: int, text: str) -> None:
-        who = self.admin_id
-        field = self.pending.pop(who, None)
-        if field is None:
-            await self.send(chat_id, screens.home(self.view()))
+        elif ident == "ssh_pubkey":
+            await self.add_key(chat_id, text)
             return
-        if field == "client_name":
-            await self.do_add_client(chat_id, text)
-            return
-        try:
-            notice = self.flows.apply_field(self.state, field, text)
-        except (ValidationError, ConfigError) as exc:
-            self.pending[who] = field
-            await self.send(chat_id, screens.prompt(self.flows.field(field), error=str(exc)))
-            return
-        self.save()
-        self.pending.pop(who, None)
-        target = self.flows.target(field)
-        if field in SECRET_FIELDS:
-            notice = notice + ", доступ обновите через проверку связи"
-        if target == "ssh":
-            await self.send(chat_id, screens.ssh_settings(self.view(notice=notice)))
-            return
-        if target == "setup":
-            await self.send(chat_id, screens.setup(self.view(notice=notice)))
-            return
-        if target == "client":
-            await self.send(chat_id, screens.link_settings(self.view(notice=notice)))
-            return
-        if target == "client_new":
-            await self.send(chat_id, screens.clients(self.view(notice=notice)))
-            return
-        await self.send(chat_id, screens.home(self.view(notice=notice)))
+        else:
+            raise ConfigError(f"unknown ssh field: {ident}")
 
     async def on_callback(self, evt: object) -> None:
-        if not await self.guard(evt):
+        if not await self.guard_admin(evt):
+            return
+        if not self.allowed(int(getattr(evt, "from_id", 0) or 0), "callback", self.callback_limit, 60.0):
+            await self.toast(evt, self.tr()("TOAST_RATE"), alert=True)
             return
         data = str(getattr(evt, "data", "") or "")
         chat_id = int(getattr(evt, "chat_id", 0) or 0)
         msg_id = int(getattr(evt, "msg_id", 0) or 0)
         if self.busy and not data.startswith("nav:"):
-            await self.toast(evt, "дождитесь завершения операции", alert=True)
+            await self.toast(evt, self.tr()("TOAST_BUSY"), alert=True)
             return
-        self.pending.pop(self.admin_id, None)
+        if not data.startswith("nav:") and not data.startswith("lang:"):
+            if not self.audit.first_time(int(getattr(evt, "from_id", 0) or 0), data, time.monotonic()):
+                await self.toast(evt, self.tr()("TOAST_REPEAT"), alert=True)
+                return
+            if not self.allowed(int(getattr(evt, "from_id", 0) or 0), "expensive", self.expensive_limit, 300.0):
+                self.audit.note(int(getattr(evt, "from_id", 0) or 0), data, "throttled")
+                await self.toast(evt, self.tr()("TOAST_RATE"), alert=True)
+                return
         try:
             await self.route(chat_id, msg_id, data)
-        except (ControlError, ValidationError, LinkError, ConfigError, PanelError) as exc:
-            await self.render(chat_id, msg_id, screens.error_screen(self.view(), "Ошибка", str(exc)))
+        except (PanelError, ModelError, ConfigError, RpcError, ShellError) as exc:
+            message = getattr(exc, "message", str(exc))
+            await self.render(chat_id, msg_id, screens.error_screen(self.view(), self.tr()("ERR_TITLE"), message))
         except Exception as exc:
             log.exception("callback failed: %s", data)
-            await self.render(chat_id, msg_id, screens.error_screen(self.view(), "Сбой", f"{type(exc).__name__}: {exc}"))
+            await self.render(chat_id, msg_id, screens.error_screen(self.view(), self.tr()("ERR_CRASH_TITLE"), f"{type(exc).__name__}: {exc}"))
 
     async def route(self, chat_id: int, msg_id: int, data: str) -> None:
         parts = data.split(":")
@@ -296,437 +356,174 @@ class Bot:
         if head == "nav":
             await self.navigate(chat_id, msg_id, parts[1] if len(parts) > 1 else "home")
             return
-        if head == "srv":
-            await self.server_action(chat_id, msg_id, parts[1] if len(parts) > 1 else "")
+        if head == "lang":
+            await self.language_action(chat_id, msg_id, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
             return
         if head == "ssh":
-            await self.ssh_action(chat_id, msg_id, ":".join(parts[1:]))
+            await self.ssh_action(chat_id, msg_id, parts[1] if len(parts) > 1 else "")
             return
-        if head == "setup":
-            await self.setup_action(chat_id, msg_id, parts)
+        if head == "fb":
+            await self.ban_action(chat_id, msg_id, parts[1] if len(parts) > 1 else "")
             return
-        if head == "cli":
-            await self.client_action(chat_id, msg_id, parts)
-            return
-        if head == "lnk":
-            await self.link_action(chat_id, msg_id, parts)
-            return
-        if head == "log":
-            await self.log_action(chat_id, msg_id, parts)
+        if head == "sshd":
+            await self.sshd_action(chat_id, msg_id, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
             return
         if head == "xr":
             await self.xray.route(chat_id, msg_id, data)
             return
-        if head == "maint":
-            await self.maint_action(chat_id, msg_id, parts)
+        await self.render(chat_id, msg_id, screens.home(self.view(notice=self.tr()("HOME_NOTICE_UNKNOWN"))))
+
+    async def language_action(self, chat_id: int, msg_id: int, action: str, code_value: str) -> None:
+        choice = code_value or action
+        if action == "set" and choice in i18n.LANGUAGES:
+            self.state.language = i18n.normalize(choice)
+            self.save()
+            notice = i18n.t("LANG_CHANGED", self.language, name=i18n.t("LANG_NAME", self.language))
+            await self.render(chat_id, msg_id, screens.language_screen(self.view(notice=notice)))
             return
-        await self.render(chat_id, msg_id, screens.home(self.view(notice="неизвестная команда")))
+        await self.render(chat_id, msg_id, screens.language_screen(self.view()))
 
     async def navigate(self, chat_id: int, msg_id: int, page: str) -> None:
-        if page == "home":
+        if page == "server" or page == "home":
             await self.render(chat_id, msg_id, screens.home(self.view()))
-            return
-        if page == "server":
-            await self.render(chat_id, msg_id, screens.server(self.view()))
             return
         if page == "ssh":
             await self.render(chat_id, msg_id, screens.ssh_settings(self.view()))
             return
-        if page == "setup":
-            await self.render(chat_id, msg_id, screens.setup(self.view()))
+        if page == "settings":
+            await self.render(chat_id, msg_id, screens.settings(self.view()))
             return
-        if page == "clients":
-            await self.do_clients(chat_id, msg_id)
+        if page == "ban":
+            await self.render(chat_id, msg_id, screens.ban_screen(self.view()))
             return
-        if page == "link":
-            await self.render(chat_id, msg_id, screens.link_settings(self.view()))
-            return
-        if page == "logs":
-            await self.log_action(chat_id, msg_id, ["log", "refresh"])
-            return
-        if page == "xray":
-            await self.render(chat_id, msg_id, xscreens.home(self.xray.view()))
-            return
-        if page == "maint":
-            await self.render(chat_id, msg_id, screens.maintenance(self.view()))
+        if page == "sshd":
+            await self.render(chat_id, msg_id, screens.sshd_screen(self.view()))
             return
         if page == "help":
             await self.render(chat_id, msg_id, screens.help_screen(self.view()))
             return
-        if page == "import":
-            await self.render(chat_id, msg_id, screens.import_screen(self.view()))
+        if page == "lang":
+            await self.render(chat_id, msg_id, screens.language_screen(self.view()))
+            return
+        if page == "xray":
+            await self.render(chat_id, msg_id, xscreens.home(self.xray.view()))
             return
         await self.render(chat_id, msg_id, screens.home(self.view()))
 
-    async def server_action(self, chat_id: int, msg_id: int, action: str) -> None:
-        if action == "check":
-            await self.do_check(chat_id, msg_id)
-            return
-        if action in {"apply", "install", "start"}:
-            await self.do_apply(chat_id, msg_id, update=False)
-            return
-        if action == "stop":
-            await self.do_stop(chat_id, msg_id)
-            return
-        if action == "restart":
-            await self.do_restart(chat_id, msg_id)
-            return
-        if action == "uninstall":
-            await self.render(chat_id, msg_id, screens.confirm_uninstall(self.view(), "srv:uninstall2"))
-            return
-        if action == "uninstall2":
-            await self.do_uninstall(chat_id, msg_id)
-            return
-        if action == "reset":
-            await self.render(chat_id, msg_id, screens.confirm_reset(self.view()))
-            return
-        if action == "reset2":
-            await self.do_reset(chat_id, msg_id)
-            return
-        await self.render(chat_id, msg_id, screens.server(self.view()))
-
     async def ssh_action(self, chat_id: int, msg_id: int, action: str) -> None:
-        if action.startswith("edit:"):
-            self.pending[self.admin_id] = action.split(":", 1)[1]
-            await self.render(chat_id, msg_id, screens.prompt(self.flows.field(self.pending[self.admin_id])))
-            return
-        if action == "clearfp":
-            self.state.ssh.fingerprint = ""
-            self.save()
-            await self.render(chat_id, msg_id, screens.ssh_settings(self.view(notice="отпечаток сброшен")))
-            return
-        if action == "togglemode":
-            self.flows.toggle_ssh_mode(self.state)
-            self.save()
-            await self.render(chat_id, msg_id, screens.ssh_settings(self.view(notice="способ входа переключен")))
-            return
         await self.render(chat_id, msg_id, screens.ssh_settings(self.view()))
 
-    async def setup_action(self, chat_id: int, msg_id: int, parts: list[str]) -> None:
-        action = parts[1] if len(parts) > 1 else ""
-        value = parts[2] if len(parts) > 2 else ""
-        if action == "edit":
-            self.pending[self.admin_id] = value
-            await self.render(chat_id, msg_id, screens.prompt(self.flows.field(value)))
-            return
-        if action == "backend":
-            self.flows.set_backend(self.state, value)
-        elif action == "method":
-            self.flows.set_method(self.state, value)
-        elif action == "mode":
-            self.flows.set_mode(self.state, value)
-        elif action == "ver":
-            self.flows.set_version(self.state, value)
-        elif action == "obf":
-            if value == "menu":
-                await self.render(chat_id, msg_id, screens.obf_menu(self.view()))
-                return
-            self.flows.set_obf(self.state, value)
-        elif action == "genkey":
-            self.flows.generate_obf_key(self.state)
-        else:
-            await self.render(chat_id, msg_id, screens.setup(self.view()))
-            return
-        self.save()
-        await self.render(chat_id, msg_id, screens.setup(self.view(notice="параметры обновлены")))
-
-    async def client_action(self, chat_id: int, msg_id: int, parts: list[str]) -> None:
-        action = parts[1] if len(parts) > 1 else ""
-        name = parts[2] if len(parts) > 2 else ""
-        if action == "add":
-            self.pending[self.admin_id] = "client_name"
-            await self.render(chat_id, msg_id, screens.prompt(self.flows.field("client_name")))
-            return
-        if action == "refresh":
-            await self.do_clients(chat_id, msg_id)
-            return
-        if action == "open":
-            await self.render(chat_id, msg_id, screens.client(self.view(), name))
-            return
-        if action == "link":
-            await self.do_client_link(chat_id, msg_id, name)
-            return
-        if action == "wg":
-            await self.do_client_wg(chat_id, msg_id, name)
-            return
-        if action == "cfg":
-            await self.render(chat_id, msg_id, screens.config_screen(self.view(), name))
-            return
-        if action == "del":
-            await self.render(chat_id, msg_id, screens.confirm_remove(self.view(), name))
-            return
-        if action == "del2":
-            await self.do_remove_client(chat_id, msg_id, name)
-            return
-        await self.render(chat_id, msg_id, screens.clients(self.view()))
-
-    async def link_action(self, chat_id: int, msg_id: int, parts: list[str]) -> None:
-        action = parts[1] if len(parts) > 1 else ""
-        value = parts[2] if len(parts) > 2 else ""
-        if action == "edit":
-            self.pending[self.admin_id] = value
-            await self.render(chat_id, msg_id, screens.prompt(self.flows.field(value)))
-            return
-        if action == "cycle":
-            self.flows.cycle(self.state, value)
-            self.save()
-            await self.render(chat_id, msg_id, screens.link_settings(self.view(notice="значение изменено")))
-            return
-        if action == "toggle":
-            self.flows.toggle_link(self.state, value)
-            self.save()
-            await self.render(chat_id, msg_id, screens.link_settings(self.view(notice="переключатель изменен")))
-            return
-        await self.render(chat_id, msg_id, screens.link_settings(self.view()))
-
-    async def log_action(self, chat_id: int, msg_id: int, parts: list[str]) -> None:
-        action = parts[1] if len(parts) > 1 else "refresh"
-        if action == "tail" and len(parts) > 2:
+    async def ban_action(self, chat_id: int, msg_id: int, action: str) -> None:
+        t = self.tr()
+        port = int(self.state.xray.sub_port)
+        self.audit.note(self.admin_id, "ban:%s" % action, "start")
+        if action == "install":
+            await self.render(
+                chat_id,
+                msg_id,
+                screens.busy_screen(t("BUSY_FB_ENABLE"), self.language, [t("BUSY_STEP_JAIL"), t("BUSY_STEP_CHECK"), t("BUSY_STEP_RESTART")]),
+            )
             try:
-                self.state.log_tail = max(20, min(2000, int(parts[2])))
-                self.save()
-            except ValueError:
-                pass
-        await self.do_logs(chat_id, msg_id)
-
-    async def maint_action(self, chat_id: int, msg_id: int, parts: list[str]) -> None:
-        action = parts[1] if len(parts) > 1 else ""
-        if action == "update":
-            await self.do_apply(chat_id, msg_id, update=True)
+                self.ban = await self.guard.install(
+                    self.state.ssh,
+                    port=port,
+                    bantime=int(self.state.xray.fail2ban_bantime or DEFAULT_BANTIME),
+                    ssh_bantime=self.state.xray.fail2ban_ssh_bantime,
+                    ssh_maxretry=int(self.state.xray.fail2ban_ssh_maxretry),
+                    ignoreip=self.state.xray.fail2ban_ignoreip,
+                )
+            except RpcError as exc:
+                await self.render(chat_id, msg_id, screens.ban_screen(self.view(error=exc.message)))
+                return
+            self.state.xray.fail2ban_enabled = True
+            self.save()
+            await self.render(chat_id, msg_id, screens.ban_screen(self.view(notice=t("FB_NOTICE_ON"))))
             return
-        if action == "restart":
-            await self.do_restart(chat_id, msg_id)
-            return
-        if action == "uninstall":
-            await self.render(chat_id, msg_id, screens.confirm_uninstall(self.view()))
-            return
-        if action == "uninstall2":
-            await self.do_uninstall(chat_id, msg_id)
+        if action == "remove":
+            try:
+                self.ban = await self.guard.remove(self.state.ssh, port=port)
+            except RpcError as exc:
+                await self.render(chat_id, msg_id, screens.ban_screen(self.view(error=exc.message)))
+                return
+            self.state.xray.fail2ban_enabled = False
+            self.save()
+            await self.render(chat_id, msg_id, screens.ban_screen(self.view(notice=t("FB_NOTICE_OFF"))))
             return
         if action == "reset":
-            await self.render(chat_id, msg_id, screens.confirm_reset(self.view()))
+            try:
+                self.ban = await self.guard.remove(self.state.ssh, port=port)
+                self.ban = await self.guard.install(
+                    self.state.ssh,
+                    port=port,
+                    bantime=int(self.state.xray.fail2ban_bantime or DEFAULT_BANTIME),
+                    ssh_bantime=self.state.xray.fail2ban_ssh_bantime,
+                    ssh_maxretry=int(self.state.xray.fail2ban_ssh_maxretry),
+                    ignoreip=self.state.xray.fail2ban_ignoreip,
+                )
+            except RpcError as exc:
+                await self.render(chat_id, msg_id, screens.ban_screen(self.view(error=exc.message)))
+                return
+            await self.render(chat_id, msg_id, screens.ban_screen(self.view(notice=t("FB_NOTICE_RESET"))))
             return
-        if action == "reset2":
-            await self.do_reset(chat_id, msg_id)
-            return
-        await self.render(chat_id, msg_id, screens.maintenance(self.view()))
-
-    def require_ssh(self) -> None:
-        if not self.state.ssh.is_ready():
-            raise ConfigError("сначала заполните доступ по SSH в разделе SSH")
-
-    async def stage(self, chat_id: int, msg_id: int, title: str) -> Draft:
-        await self.render(chat_id, msg_id, screens.busy_screen(title))
-        draft = Draft(self.app, chat_id, DRAFT_ID)
-        await draft.__aenter__()
-        await draft.say(title)
-        return draft
-
-    async def handshake(self, draft: Draft) -> None:
-        await draft.say("проверка связи по ssh", "connect")
-        fingerprint = await self.control.connect_check(self.state.ssh)
-        stored = self.state.ssh.fingerprint
-        if stored and fingerprint != stored:
-            raise ControlError("отпечаток сервера изменился, соединение отклонено", "host_key_changed")
-        self.state.ssh.fingerprint = fingerprint
-        self.state.ssh.mode = await self.control.detect_mode(self.state.ssh)
-        self.save()
-        await draft.say("определение прав", self.state.ssh.mode)
-
-    async def do_check(self, chat_id: int, msg_id: int) -> None:
-        self.require_ssh()
-        self.busy = True
-        draft = await self.stage(chat_id, msg_id, "проверка сервера")
-        try:
+        if action == "status":
             try:
-                await self.handshake(draft)
-                await draft.say("чтение состояния установки")
-                self.probe = await self.control.probe(self.state.ssh)
-                if self.probe.config is not None:
-                    self.state.opts.from_probe(self.probe.config)
-                    self.save()
-                await draft.say("чтение списка клиентов")
-                self.clients, self.share = await self.control.clients(self.state.ssh)
-                await draft.say("готово")
-            finally:
-                await draft.close()
-            await self.render(chat_id, msg_id, screens.server(self.view(notice="сервер на связи")))
-        finally:
-            self.busy = False
-
-    async def do_apply(self, chat_id: int, msg_id: int, update: bool) -> None:
-        self.require_ssh()
-        self.flows.validate_server(self.state)
-        self.busy = True
-        draft = await self.stage(chat_id, msg_id, "перезапуск ядра" if update else "применение конфигурации")
-        try:
-            try:
-                await self.handshake(draft)
-                await draft.say("установка free turn proxy" if not update else "обновление ядра")
-                response = await self.control.apply(self.state.ssh, self.state.opts, update=update)
-                self.apply_owner(response)
-                await draft.say("проверка результата")
-                self.probe = await self.control.probe(self.state.ssh)
-                self.clients, self.share = await self.control.clients(self.state.ssh)
-                await draft.say("готово")
-            finally:
-                await draft.close()
-            notice = "ядро обновлено" if update else "сервер настроен"
-            await self.render(chat_id, msg_id, screens.server(self.view(notice=notice)))
-        finally:
-            self.busy = False
-
-    def apply_owner(self, response: ControlResponse) -> None:
-        owner = response.data.get("owner") or {}
-        key = str(response.data.get("obf_key") or "")
-        if key:
-            self.state.opts.obf_key = key
-        client_id = str(owner.get("client_id") or "")
-        if client_id:
-            self.state.owner_client_id = client_id
-        conf_b64 = str(owner.get("conf_b64") or "")
-        if conf_b64:
-            try:
-                self.state.owner_conf = normalize_conf(base64.b64decode(conf_b64).decode("utf-8", "replace"))
-            except (ValueError, UnicodeDecodeError):
-                self.state.owner_conf = ""
-        self.save()
-
-    async def do_stop(self, chat_id: int, msg_id: int) -> None:
-        self.require_ssh()
-        self.busy = True
-        draft = await self.stage(chat_id, msg_id, "остановка сервиса")
-        try:
-            try:
-                await self.handshake(draft)
-                await self.control.stop(self.state.ssh)
-                await draft.say("чтение состояния")
-                self.probe = await self.control.probe(self.state.ssh)
-            finally:
-                await draft.close()
-            await self.render(chat_id, msg_id, screens.server(self.view(notice="сервис остановлен")))
-        finally:
-            self.busy = False
-
-    async def do_restart(self, chat_id: int, msg_id: int) -> None:
-        self.require_ssh()
-        self.busy = True
-        draft = await self.stage(chat_id, msg_id, "перезапуск сервиса")
-        try:
-            try:
-                await self.handshake(draft)
-                await self.control.restart(self.state.ssh)
-                await draft.say("чтение состояния")
-                self.probe = await self.control.probe(self.state.ssh)
-            finally:
-                await draft.close()
-            await self.render(chat_id, msg_id, screens.server(self.view(notice="сервис перезапущен")))
-        finally:
-            self.busy = False
-
-    async def do_logs(self, chat_id: int, msg_id: int) -> None:
-        self.require_ssh()
-        tail = int(self.state.log_tail)
-        lines = await self.control.logs(self.state.ssh, tail)
-        await self.render(chat_id, msg_id, screens.logs(self.view(), lines, tail))
-
-    async def do_clients(self, chat_id: int, msg_id: int) -> None:
-        self.require_ssh()
-        self.clients, self.share = await self.control.clients(self.state.ssh)
-        await self.render(chat_id, msg_id, screens.clients(self.view(notice=f"клиентов: {len(self.clients)}")))
-
-    async def do_client_link(self, chat_id: int, msg_id: int, name: str) -> None:
-        self.require_ssh()
-        client, conf = await self.control.client_conf(self.state.ssh, name)
-        if name == "owner":
-            if client.client_id:
-                self.state.owner_client_id = client.client_id
-            if conf:
-                self.state.owner_conf = normalize_conf(conf)
-            conf = conf or self.state.owner_conf
+                self.ban = await self.guard.status(self.state.ssh, port=port)
+            except RpcError as exc:
+                await self.render(chat_id, msg_id, screens.ban_screen(self.view(error=exc.message)))
+                return
+            self.state.xray.fail2ban_enabled = self.ban.active
             self.save()
-        link = build_link(self.peer(), self.state.opts, self.state.link, client.client_id, name, conf)
-        await self.render(chat_id, msg_id, screens.link_screen(self.view(), name, link, conf, client))
-
-    async def do_client_wg(self, chat_id: int, msg_id: int, name: str) -> None:
-        self.require_ssh()
-        client, conf = await self.control.client_conf(self.state.ssh, name)
-        if not conf:
-            conf = self.state.owner_conf if name == "owner" else ""
-        if not conf:
-            raise ControlError("сервер не вернул конфигурацию клиента", "not_found")
-        await self.render(chat_id, msg_id, screens.wg_screen(self.view(), name, conf, client))
-
-    async def do_add_client(self, chat_id: int, name: str) -> None:
-        self.require_ssh()
-        clean = validate.name(name)
-        client, conf = await self.control.client_add(self.state.ssh, clean)
-        self.clients, self.share = await self.control.clients(self.state.ssh)
-        link = build_link(self.peer(), self.state.opts, self.state.link, client.client_id, clean, conf)
-        receipt = screens.link_screen(self.view(notice=f"клиент {clean} добавлен"), clean, link, conf, client)
-        await self.send(chat_id, receipt)
-
-    async def do_remove_client(self, chat_id: int, msg_id: int, name: str) -> None:
-        self.require_ssh()
-        await self.control.client_remove(self.state.ssh, name)
-        self.clients, self.share = await self.control.clients(self.state.ssh)
-        await self.render(chat_id, msg_id, screens.clients(self.view(notice=f"клиент {name} удален")))
-
-    async def do_uninstall(self, chat_id: int, msg_id: int) -> None:
-        self.require_ssh()
-        self.busy = True
-        draft = await self.stage(chat_id, msg_id, "удаление установки")
-        try:
-            try:
-                await self.handshake(draft)
-                await self.control.uninstall(self.state.ssh)
-                await draft.say("готово")
-            finally:
-                await draft.close()
-            self.probe = None
-            self.clients = []
-            self.share = None
-            await self.render(chat_id, msg_id, screens.server(self.view(notice="установка удалена")))
-        finally:
-            self.busy = False
-
-    async def do_reset(self, chat_id: int, msg_id: int) -> None:
-        self.require_ssh()
-        opts = self.state.opts
-        self.flows.validate_server(self.state)
-        self.busy = True
-        draft = await self.stage(chat_id, msg_id, "переустановка с нуля")
-        outcome: ResetOutcome | None = None
-        try:
-            try:
-                await self.handshake(draft)
-
-                async def step(text: str) -> None:
-                    await draft.say(text)
-
-                outcome = await self.control.hard_reset(self.state.ssh, opts, on_step=step)
-                if outcome.response is not None:
-                    self.apply_owner(outcome.response)
-                await draft.say("ядро " + opts.version + " установлено заново")
-                self.probe = outcome.probe
-                await draft.say("чтение списка клиентов")
-                self.clients, self.share = await self.control.clients(self.state.ssh)
-                await draft.say("готово")
-            finally:
-                await draft.close()
-            notice = "сервер очищен и установлен заново, версия " + opts.version
-            await self.render(chat_id, msg_id, screens.server(self.view(notice=notice)))
-        finally:
-            self.busy = False
-
-    async def do_import(self, chat_id: int, text: str) -> None:
-        try:
-            data = parse_link(text)
-        except LinkError as exc:
-            await self.send(chat_id, screens.import_screen(self.view(), error=str(exc)))
+            await self.render(chat_id, msg_id, screens.ban_screen(self.view(notice=t("FB_NOTICE_STATUS"))))
             return
-        await self.send(chat_id, screens.import_screen(self.view(), rows=link_rows(data), raw=text))
+        await self.render(chat_id, msg_id, screens.ban_screen(self.view()))
 
-    def peer(self) -> str:
-        host = self.state.opts.host or self.state.ssh.host
-        return f"{host}:{int(self.state.opts.listen_port)}"
+    async def sshd_action(self, chat_id: int, msg_id: int, action: str, value: str) -> None:
+        t = self.tr()
+        if action == "status":
+            try:
+                self.sshd = await self.guard.ssh_status(self.state.ssh)
+            except RpcError as exc:
+                await self.render(chat_id, msg_id, screens.sshd_screen(self.view(error=exc.message)))
+                return
+            await self.render(chat_id, msg_id, screens.sshd_screen(self.view(notice=t("SSHD_NOTICE_STATUS"))))
+            return
+        if action == "remove":
+            try:
+                self.sshd = await self.guard.ssh_remove(self.state.ssh)
+            except RpcError as exc:
+                await self.render(chat_id, msg_id, screens.sshd_screen(self.view(error=exc.message)))
+                return
+            await self.render(chat_id, msg_id, screens.sshd_screen(self.view(notice=t("SSHD_NOTICE_REMOVE"))))
+            return
+        if action == "auth":
+            await self.harden(chat_id, password=value)
+            return
+        if action == "root":
+            await self.harden(chat_id, root=value)
+            return
+        await self.render(chat_id, msg_id, screens.sshd_screen(self.view()))
+
+    async def harden(self, chat_id: int, port: int = 0, password: str = "", root: str = "") -> None:
+        actor = self.admin_id
+        detail = "port=%d password=%s root=%s" % (int(port or 0), "set" if password else "-", "set" if root else "-")
+        try:
+            self.sshd = await self.guard.ssh_apply(self.state.ssh, port=port, password=password, root=root)
+        except RpcError as exc:
+            self.audit.note(actor, "sshd:harden", "failed", detail)
+            await self.send(chat_id, screens.sshd_screen(self.view(error=exc.message)))
+            return
+        self.audit.note(actor, "sshd:harden", "ok", detail)
+        if port:
+            self.save()
+        await self.send(chat_id, screens.sshd_screen(self.view(notice=self.tr()("SSHD_NOTICE_APPLIED"))))
+
+    async def add_key(self, chat_id: int, public_key: str) -> None:
+        actor = self.admin_id
+        try:
+            self.sshd = await self.guard.ssh_add_key(self.state.ssh, public_key)
+        except RpcError as exc:
+            self.audit.note(actor, "sshd:add-key", "failed")
+            await self.send(chat_id, screens.sshd_screen(self.view(error=exc.message)))
+            return
+        self.audit.note(actor, "sshd:add-key", "ok")
+        await self.send(chat_id, screens.sshd_screen(self.view(notice=self.tr()("SSHD_NOTICE_KEY"))))

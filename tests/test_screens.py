@@ -1,264 +1,232 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
-from goygram.rich import Rich
 
-from BOT import screens
-from BOT.links import build_link
-from BOT.models import ClientInfo, ProbeResult, RemoteConfig, ShareInfo
-from BOT.screens import View
-from BOT.ui import count_buttons
-from tests.fakes import WG, make_state
-
-BUTTON_RE = re.compile(r"<tg-button ([^>]*)>([^<]*)</tg-button>")
-ROW_RE = re.compile(r"<tg-button-row[^>]*>(.*?)</tg-button-row>", re.S)
-CALLBACK_RE = re.compile(r'data="([^"]*)"')
+from BOT import i18n, screens
+from BOT.guard import BanState, SshState
+from BOT.scan import ScanResult
+from BOT.store import State, Store
+from BOT.ui import MAX_BUTTONS, count_buttons
+from BOT.xray import XrayState, new_inbound
 
 
-def full_view() -> View:
-    state = make_state()
-    return View(
-        state=state,
-        probe=ProbeResult(
-            installed=True,
-            running=True,
-            version="4.1.0",
-            euid=0,
-            arch="x86_64",
-            method="docker",
-            config=RemoteConfig(method="docker", backend="new", listen_port=56000, obf_key="a" * 64),
-        ),
-        clients=[
-            ClientInfo(name="owner", client_id="cid-owner", is_self=True, ip="10.13.13.2", pub="cHVi", handshake=1700000000),
-            ClientInfo(name="phone", client_id="cid-phone", ip="10.13.13.3"),
-        ],
-        share=ShareInfo(backend="new", host="203.0.113.10", port=56000, mode="udp", obf_profile="rtpopus3"),
-        notice="уведомление",
+def make_view(tmp_path: Path, **kwargs: object) -> screens.View:
+    state = State(xray=XrayState())
+    state.xray.inbounds.append(new_inbound("vless", 443, "raw", "reality"))
+    return screens.View(state=state, **kwargs)
+
+
+def test_home_renders_without_server_state(tmp_path: Path) -> None:
+    view = make_view(tmp_path)
+    html = screens.home(view).to_html()
+    assert "OBHOD" in html
+    assert "vless" in html
+    assert count_buttons(html) <= MAX_BUTTONS
+
+
+def test_home_reports_core_and_ban_state(tmp_path: Path) -> None:
+    view = make_view(tmp_path, core={"installed": True, "service": "active", "version": "26.10.21", "listening": [443]})
+    html = screens.home(view).to_html()
+    assert "26.10.21" in html
+    assert "443" in html
+
+
+def test_ssh_settings_shows_a_local_shell(tmp_path: Path) -> None:
+    view = make_view(tmp_path)
+    html = screens.ssh_settings(view).to_html()
+    assert i18n.t("SSH_LOCAL_MODE") in html
+    assert i18n.t("SSH_NO_PASSWORD") in html
+    assert "ssh_host" not in html
+    assert "ssh_new_port" in html
+    assert "ssh_pubkey" in html
+    assert count_buttons(html) <= MAX_BUTTONS
+
+
+def test_settings_screen_shows_subscription_path_format(tmp_path: Path) -> None:
+    html = screens.settings(make_view(tmp_path)).to_html()
+    assert "&lt;64&gt;/&lt;64&gt;" in html
+
+
+def test_ban_screen_reports_jail_and_rules(tmp_path: Path) -> None:
+    ban = BanState(installed=True, jails=["3x-ipl", "obhod-sshd"], banned=["1.2.3.4"], chain_rules=["DROP all -- 1.2.3.4"])
+    view = make_view(tmp_path, ban=ban)
+    view.state.xray.fail2ban_enabled = True
+    html = screens.ban_screen(view).to_html()
+    assert "3x-ipl" in html
+    assert "1.2.3.4" in html
+    assert "OBHOD-IPL" in html
+
+
+def test_ban_screen_shows_limits(tmp_path: Path) -> None:
+    html = screens.ban_screen(make_view(tmp_path)).to_html()
+    assert "maxretry 1" in html
+    assert "findtime 32" in html
+    assert "LIMIT_IP" in html
+
+
+def test_sshd_screen_reports_options(tmp_path: Path) -> None:
+    item = SshState(ports=[2222], permit_root_login="no", password_authentication="no", service="active", keys=2, key_user="root")
+    html = screens.sshd_screen(make_view(tmp_path, sshd=item)).to_html()
+    assert "2222" in html
+    assert "no" in html
+    assert "2" in html
+
+
+def test_sshd_screen_without_state(tmp_path: Path) -> None:
+    html = screens.sshd_screen(make_view(tmp_path)).to_html()
+    assert i18n.t("SSHD_NOT_READ") in html
+
+
+def test_help_mentions_only_supported_surface(tmp_path: Path) -> None:
+    html = screens.help_screen(make_view(tmp_path)).to_html()
+    for word in ("vless", "raw", "grpc", "xhttp", "reality", "mlkem768x25519plus", "ml-dsa-65"):
+        assert word in html
+    for word in ("vmess", "trojan", "shadowsocks", "ws", "kcp"):
+        assert word not in html
+
+
+def test_error_and_busy_screens(tmp_path: Path) -> None:
+    view = make_view(tmp_path)
+    assert "boom" in screens.error_screen(view, i18n.t("ERR_TITLE"), "boom").to_html()
+    assert "work" in screens.busy_screen("work").to_html()
+    assert i18n.t("DENIED_BODY") in screens.denied().to_html()
+    assert i18n.t("DENIED_BODY", "ru") in screens.denied("ru").to_html()
+    assert i18n.t("DENIED_BODY", "zh") in screens.denied("zh").to_html()
+
+
+def test_prompt_screen_uses_inline_input(tmp_path: Path) -> None:
+    html = screens.prompt("ssh_new_port").to_html()
+    assert "switch_inline_query_current_chat" in html
+    html_error = screens.prompt("ssh_new_port", error="bad").to_html()
+    assert "bad" in html_error
+
+
+def test_confirm_and_logs_screens(tmp_path: Path) -> None:
+    assert "fb:install" in screens.confirm("t", "b", "fb:install").to_html()
+    html = screens.logs_screen(make_view(tmp_path), ["line"], 50).to_html()
+    assert "line" in html
+    assert "xr:logs:200" in html
+
+
+def test_subscription_hint_contains_path(tmp_path: Path) -> None:
+    html = screens.subscription_hint("/a/b", "http://host:2096/a/b").to_html()
+    assert "/a/b" in html
+    assert "secrets" in html
+
+
+def render_all(lang: str = i18n.DEFAULT_LANGUAGE) -> list[tuple[str, object]]:
+    from BOT import xscreens
+    from BOT.xray import XrayState as _State
+
+    state = State(xray=_State())
+    inbound = new_inbound("vless", 443, "raw", "reality")
+    inbound.make_client("owner")
+    state.xray.add(inbound)
+    state.xray.scan_targets = ["www.google.com:443"]
+    core = {"installed": True, "service": "active", "version": "26.10.21", "listening": [443], "ports": [443]}
+    view = screens.View(state=state, core=core, ban=BanState(installed=True, jails=["3x-ipl"], banned=["1.2.3.4"]), sshd=SshState(ports=[22]), lang=lang)
+    xview = xscreens.XrayView(state=state.xray, core=core, lang=lang)
+    xview.draft = {"network": "xhttp", "security": "reality", "port": "443"}
+    result = ScanResult(
+        target="www.google.com:443",
+        host="www.google.com",
+        port=443,
+        feasible=True,
+        tls13=True,
+        h2=True,
+        x25519=True,
+        pq_hybrid=True,
+        pq_group="x25519mlkem768",
+        cert_valid=True,
+        days_left=30,
+        latency_ms=8,
+        server_names=["www.google.com"],
     )
-
-
-def render_all() -> list[tuple[str, Rich]]:
-    view = full_view()
-    link = build_link("203.0.113.10:56000", view.state.opts, view.state.link, "cid-owner", "owner", WG)
-    client = view.clients[0]
-    items: list[tuple[str, Rich]] = [
+    items: list[tuple[str, object]] = [
         ("home", screens.home(view)),
-        ("server", screens.server(view)),
-        ("ssh", screens.ssh_settings(view)),
-        ("setup", screens.setup(view)),
-        ("obf", screens.obf_menu(view)),
-        ("clients", screens.clients(view)),
-        ("client", screens.client(view, "owner")),
-        ("confirm_remove", screens.confirm_remove(view, "phone")),
-        ("confirm_uninstall", screens.confirm_uninstall(view)),
-        ("link_settings", screens.link_settings(view)),
-        ("link", screens.link_screen(view, "owner", link, WG, client)),
-        ("wg", screens.wg_screen(view, "owner", WG, client)),
-        ("config", screens.config_screen(view, "owner")),
-        ("logs", screens.logs(view, [f"line {index}" for index in range(40)], 200)),
-        ("maint", screens.maintenance(view)),
+        ("settings", screens.settings(view)),
+        ("ssh_settings", screens.ssh_settings(view)),
+        ("ban", screens.ban_screen(view)),
+        ("sshd", screens.sshd_screen(view)),
         ("help", screens.help_screen(view)),
-        ("import", screens.import_screen(view, rows=[("peer", "203.0.113.10:56000")], raw=link)),
-        ("import_error", screens.import_screen(view, error="ссылка не разобрана")),
-        ("error", screens.error_screen(view, "Ошибка", "нет связи")),
-        ("prompt", screens.prompt(_spec())),
-        ("prompt_error", screens.prompt(_spec(), error="порт вне диапазона")),
-        ("busy", screens.busy_screen("применение", "шаг 1")),
-        ("denied", screens.denied()),
-        ("void", screens.void()),
+        ("prompt", screens.prompt("ssh_new_port", lang)),
+        ("confirm", screens.confirm("t", "b", "fb:install", lang)),
+        ("logs", screens.logs_screen(view, ["line"], 50)),
+        ("busy", screens.busy_screen("busy", lang, ["step"])),
+        ("xray_home", xscreens.home(xview)),
+        ("xray_new", xscreens.new_menu(xview)),
+        ("xray_custom", xscreens.custom_menu(xview)),
+        ("xray_inbound", xscreens.inbound_screen(xview, inbound)),
+        ("xray_links", xscreens.links_screen(xview, inbound, "203.0.113.10", [("owner", "vless://uuid@host:443")])),
+        ("xray_client", xscreens.client_screen(xview, inbound, "owner", "vless://x", "http://h:2096/a/b", "/a/b")),
+        ("xray_mldsa", xscreens.mldsa_screen(xview, inbound)),
+        ("xray_subs", xscreens.subs_screen(xview, [("owner", "/a/b", "http://h:2096/a/b")])),
+        ("xray_core", xscreens.core_screen(xview)),
+        ("xray_scan", xscreens.scan_screen(xview, [result])),
+        ("xray_targets", xscreens.scan_targets_screen(xview)),
+        ("xray_input", xscreens.input_screen(xview, "xr_port", "1", "xr:in:1")),
+        ("xray_logs", xscreens.logs_screen(xview, ["line"], 200)),
+        ("language", screens.language_screen(view)),
     ]
     return items
 
 
-def _spec() -> object:
-    from BOT.flows import Flows
-
-    return Flows().field("ssh_port")
-
-
-SCREENS = render_all()
-IDS = [name for name, _ in SCREENS]
-
-
-@pytest.mark.parametrize("name,rich", SCREENS, ids=IDS)
-def test_screen_is_rich(name: str, rich: Rich) -> None:
-    assert isinstance(rich, Rich)
-    html = rich.build()
-    assert html.startswith("<h2>")
-    assert "None" not in html
+def test_store_roundtrip(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.json")
+    state = State(xray=XrayState())
+    state.sub_port = 2096
+    inbound = new_inbound("vless", 443, "raw", "reality")
+    inbound.make_client("owner")
+    state.xray.add(inbound)
+    state.xray.sub_address = "203.0.113.10"
+    store.save(state)
+    again = store.load()
+    assert again.sub_port == 2096
+    assert again.xray.inbounds[0].clients[0].email == "owner"
+    assert again.xray.inbounds[0].clients[0].sub_key
+    assert again.xray.sub_address == "203.0.113.10"
 
 
-@pytest.mark.parametrize("name,rich", SCREENS, ids=IDS)
-def test_buttons_inside_rows(name: str, rich: Rich) -> None:
-    html = rich.build()
-    inside = sum(count_buttons(body) for body in ROW_RE.findall(html))
-    assert inside == count_buttons(html)
+def test_store_ignores_broken_file(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text("{", encoding="utf-8")
+    assert Store(path).load().xray.inbounds == []
 
 
-@pytest.mark.parametrize("name,rich", SCREENS, ids=IDS)
-def test_callbacks_short_and_plain(name: str, rich: Rich) -> None:
-    html = rich.build()
-    for value in CALLBACK_RE.findall(html):
-        assert len(value.encode()) <= 64
-        assert " " not in value
-        assert not value.startswith("http")
+def test_store_permissions(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.json")
+    store.save(State())
+    assert oct(store.path.stat().st_mode)[-3:] == "600"
 
 
-@pytest.mark.parametrize("name,rich", SCREENS, ids=IDS)
-def test_no_url_buttons(name: str, rich: Rich) -> None:
-    assert 'type="url"' not in rich.build()
+def test_invalid_field_raises(tmp_path: Path) -> None:
+    with pytest.raises(Exception):
+        screens.prompt("nope")
 
 
-@pytest.mark.parametrize("name,rich", SCREENS, ids=IDS)
-def test_button_budget(name: str, rich: Rich) -> None:
-    assert count_buttons(rich.build()) <= 18
+@pytest.mark.parametrize("lang", i18n.LANGUAGES)
+def test_every_screen_renders_in_every_language(lang: str) -> None:
+    items = render_all(lang)
+    assert len(items) >= 24
+    for name, rich in items:
+        html = rich.build()
+        assert html, name
+        assert count_buttons(html) <= MAX_BUTTONS, name
 
 
-def test_home_facts() -> None:
-    html = screens.home(full_view()).build()
-    assert "203.0.113.10" in html
-    assert "56000" in html
-    assert "rtpopus3" in html
+@pytest.mark.parametrize("lang,pattern", [("ru", r"[\u0400-\u04ff]"), ("zh", r"[\u4e00-\u9fff]")])
+def test_screens_use_the_selected_alphabet(lang: str, pattern: str) -> None:
+    check = re.compile(pattern)
+    for name, rich in render_all(lang):
+        assert check.search(rich.build()), name
 
 
-def test_home_without_server() -> None:
-    view = full_view()
-    view.state.ssh.host = ""
-    view.probe = None
-    html = screens.home(view).build()
-    assert "не задан" in html
-    assert "состояние не читано" in html
-
-
-def test_server_backend_rows() -> None:
-    view = full_view()
-    html = screens.server(view).build()
-    assert "10.13.13.0/24" in html
-    view.state.opts.backend = "external"
-    view.state.opts.connect = "127.0.0.1:51820"
-    html = screens.server(view).build()
-    assert "127.0.0.1:51820" in html
-
-
-def test_server_apply_label_switches() -> None:
-    view = full_view()
-    view.probe = ProbeResult(installed=False)
-    html = screens.server(view).build()
-    assert "Установить на сервер" in html
-
-
-def test_clients_empty() -> None:
-    view = full_view()
-    view.clients = []
-    view.share = None
-    assert "список пуст" in screens.clients(view).build()
-
-
-def test_client_unknown_name_falls_back() -> None:
-    html = screens.client(full_view(), "ghost").build()
-    assert "ghost" in html
-
-
-def test_link_screen_contains_link() -> None:
-    view = full_view()
-    link = build_link("203.0.113.10:56000", view.state.opts, view.state.link, "cid", "owner", WG)
-    html = screens.link_screen(view, "owner", link, WG, view.clients[0]).build()
-    assert link in html
-    assert 'type="copy_text"' in html
-    assert "<details" in html
-
-
-def test_config_screen_json() -> None:
-    import json
-
-    html = screens.config_screen(full_view(), "owner").build()
-    start = html.index('class="language-json">') + len('class="language-json">')
-    end = html.index("</code>", start)
-    body = html[start:end]
-    body = body.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    data = json.loads(body)
-    assert data["peer"] == "203.0.113.10:56000"
-    assert data["clientId"] == "cid-owner"
-    assert data["obf"]["profile"] == "rtpopus3"
-
-
-def test_logs_screen_tail() -> None:
-    html = screens.logs(full_view(), ["alpha", "beta"], 200).build()
-    assert "alpha" in html
-    assert "beta" in html
-
-
-def test_prompt_shows_hint_and_error() -> None:
-    html = screens.prompt(_spec(), error="плохо").build()
-    assert "плохо" in html
-    assert "Порт SSH" in html
-
-
-def test_denied_has_no_buttons() -> None:
-    assert count_buttons(screens.denied().build()) == 0
-
-
-def test_setup_has_pinned_version_buttons() -> None:
-    html = screens.setup(full_view()).build()
-    assert 'data="setup:ver:v4.1.0"' in html
-    assert 'data="setup:ver:latest"' in html
-    assert "Своя версия" in html
-
-
-def test_setup_mentions_pinned_policy() -> None:
-    html = screens.setup(full_view()).build()
-    assert "версия ядра закреплена" in html
-
-
-def test_confirm_reset_lists_destructive_steps() -> None:
-    html = screens.confirm_reset(full_view()).build()
-    assert "переустановка с нуля" in html
-    assert "контейнер" in html
-    assert "ft-wg0" in html
-    assert "процессы" in html
-    assert "/opt/free-turn-proxy" in html
-    assert 'data="maint:reset2"' in html
-    assert "перестанут работать" in html
-
-
-def test_confirm_reset_has_single_danger_action() -> None:
-    html = screens.confirm_reset(full_view()).build()
-    buttons = BUTTON_RE.findall(html)
-    danger = [body for attrs, body in buttons if 'style="danger"' in attrs]
-    assert danger == ["Удалить все и поставить заново"]
-
-
-def test_maintenance_offers_reset() -> None:
-    html = screens.maintenance(full_view()).build()
-    assert 'data="maint:reset"' in html
-    assert "Переустановить с нуля" in html
-
-
-def test_server_screen_offers_reset_and_uninstall() -> None:
-    html = screens.server(full_view()).build()
-    assert 'data="srv:reset"' in html
-    assert 'data="srv:uninstall"' in html
-    assert 'data="maint:uninstall2"' not in html
-
-
-def test_uninstall_confirmation_follows_the_entry_point() -> None:
-    assert 'data="maint:uninstall2"' in screens.confirm_uninstall(full_view()).build()
-    assert 'data="srv:uninstall2"' in screens.confirm_uninstall(full_view(), "srv:uninstall2").build()
-
-
-def test_every_screen_stays_within_button_budget() -> None:
-    view = full_view()
-    for rich in (
-        screens.home(view),
-        screens.server(view),
-        screens.setup(view),
-        screens.maintenance(view),
-        screens.clients(view),
-        screens.link_settings(view),
-        screens.help_screen(view),
-        screens.confirm_reset(view),
-        screens.confirm_uninstall(view),
-    ):
-        assert count_buttons(rich.build()) <= 18
+def test_language_screen_lists_every_catalog() -> None:
+    view = screens.View(state=State(xray=XrayState()))
+    html = screens.language_screen(view).to_html()
+    for item in i18n.LANGUAGES:
+        assert f"lang:set:{item}" in html
+        assert i18n.t("LANG_NAME", item) in html

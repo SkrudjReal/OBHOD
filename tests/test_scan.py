@@ -11,14 +11,17 @@ import pytest
 from BOT import scan as scanner
 from BOT.scan import (
     CONCURRENCY,
+    DEFAULT_CANDIDATES,
     DISCOVER_TIMEOUT,
     DISCOVER_MAX_IPS,
     SCAN_MAX_TOTAL,
+    SCAN_TIMEOUT,
     ScanError,
     ScanResult,
     best_candidate,
     enumerate_cidr,
     normalize_host,
+    parse_candidates,
     parse_certificate,
     probe,
     proxy_header,
@@ -33,8 +36,10 @@ def test_limits_match_3xui_defaults() -> None:
     assert DISCOVER_TIMEOUT == 4.0
     assert DISCOVER_MAX_IPS == 256
     assert SCAN_MAX_TOTAL == 512
-    assert len(scanner.DEFAULT_CANDIDATES) == 10
+    assert len(scanner.DEFAULT_CANDIDATES) >= 200
+    assert len(set(scanner.DEFAULT_CANDIDATES)) == len(scanner.DEFAULT_CANDIDATES)
     assert "www.cloudflare.com:443" in scanner.DEFAULT_CANDIDATES
+    assert "www.google.com:443" in scanner.DEFAULT_CANDIDATES
 
 
 def test_split_target_variants() -> None:
@@ -131,10 +136,10 @@ def test_result_roundtrip() -> None:
 
 
 def test_result_line_for_failure() -> None:
-    item = ScanResult(target="a:443", reason="нет связи")
+    item = ScanResult(target="a:443", reason="no connection")
     line = item.line()
     assert line.startswith("no")
-    assert "нет связи" in line
+    assert "no connection" in line
 
 
 def test_parse_certificate_requires_bytes() -> None:
@@ -160,9 +165,9 @@ async def test_probe_reports_connection_error() -> None:
 
 async def test_scan_targets_requires_input() -> None:
     with pytest.raises(ScanError):
-        await scan_targets(["  "])
+        await scan_targets([], candidates=[])
     with pytest.raises(ScanError):
-        await scan_targets([])
+        await scan_targets(["  "], candidates=[])
 
 
 async def test_scan_targets_marks_bad_cidr() -> None:
@@ -210,7 +215,7 @@ def test_certificate_walker_on_openssl_cert(tmp_path: Path) -> None:
             capture_output=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
-        pytest.skip("openssl недоступен")
+        pytest.skip("openssl is not available")
     parsed = parse_certificate(der)
     assert parsed.subject_cn == "scanner.example.com"
     assert "alt.example.com" in parsed.dns_names
@@ -250,7 +255,7 @@ async def test_probe_against_local_tls_server(tmp_path: Path) -> None:
             capture_output=True,
         )
     except (OSError, subprocess.CalledProcessError):
-        pytest.skip("openssl недоступен")
+        pytest.skip("openssl is not available")
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(str(cert), str(key))
 
@@ -276,7 +281,55 @@ async def test_probe_against_local_tls_server(tmp_path: Path) -> None:
 
 
 def test_scan_result_feasibility_rule() -> None:
-    item = ScanResult(target="a:443", tls13=True, h2=True, x25519=True, cert_valid=True)
+    item = ScanResult(target="a:443", tls13=True, h2=True, x25519=True, pq_hybrid=True, cert_valid=True, days_left=30)
     assert scanner.feasible_of(item) is True
     item.h2 = False
     assert scanner.feasible_of(item) is False
+    item.h2 = True
+    item.pq_hybrid = False
+    assert scanner.feasible_of(item) is False
+    item.pq_hybrid = True
+    item.days_left = -1
+    assert scanner.feasible_of(item) is False
+
+
+def test_parse_candidates_csv() -> None:
+    assert parse_candidates("a:443, b:443; a:443") == ["a:443", "b:443"]
+    assert parse_candidates("a:443\nb:443") == ["a:443", "b:443"]
+    assert parse_candidates("") == list(DEFAULT_CANDIDATES)
+    assert parse_candidates(None) == list(DEFAULT_CANDIDATES)
+
+
+def test_default_candidate_list_is_large_and_unique() -> None:
+    assert len(DEFAULT_CANDIDATES) >= 200
+    assert len(set(DEFAULT_CANDIDATES)) == len(DEFAULT_CANDIDATES)
+    assert all(item.endswith(":443") for item in DEFAULT_CANDIDATES)
+
+
+async def test_scan_targets_uses_candidates_when_empty() -> None:
+    results = await scan_targets([], candidates=["127.0.0.1:443"], concurrency=1)
+    assert results and results[0].target == "127.0.0.1:443"
+
+
+def test_curve_id_is_reported() -> None:
+    result = ScanResult(target="a:443", x25519=True, pq_hybrid=True, pq_group="X25519MLKEM768")
+    assert result.to_dict()["curve_id"] == ""
+    result.curve_id = result.pq_group or "X25519"
+    assert result.curve_id == "X25519MLKEM768"
+    assert ScanResult.from_dict(result.to_dict()).curve_id == "X25519MLKEM768"
+
+
+def test_proxy_header_versions() -> None:
+    v1 = proxy_header(1, ("192.0.2.10", 12345), ("198.51.100.7", 443))
+    assert v1.startswith(b"PROXY TCP4 192.0.2.10 198.51.100.7 12345 443\r\n")
+    v2 = proxy_header(2, ("192.0.2.10", 12345), ("198.51.100.7", 443))
+    assert v2.startswith(b"\r\n\r\n\x00\r\nQUIT\n")
+    assert len(v2) == 16 + 12
+
+
+def test_scan_limits_match_the_reference() -> None:
+    assert SCAN_TIMEOUT == 10.0
+    assert DISCOVER_TIMEOUT == 4.0
+    assert DISCOVER_MAX_IPS == 256
+    assert SCAN_MAX_TOTAL == 512
+    assert CONCURRENCY >= 16

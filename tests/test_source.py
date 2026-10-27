@@ -8,7 +8,7 @@ import unicodedata
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 AUTHORED_PY = sorted(path for path in ROOT.rglob("*.py") if ".venv" not in path.parts and "__pycache__" not in path.parts)
-AUTHORED_SH = sorted(path for path in ROOT.rglob("*.sh") if "install.sh" != path.name and ".venv" not in path.parts)
+AUTHORED_SH = sorted(path for path in ROOT.rglob("*.sh") if ".venv" not in path.parts)
 TEXT_FILES = AUTHORED_PY + AUTHORED_SH + [
     ROOT / "README.md",
     ROOT / "REPORT.md",
@@ -77,7 +77,10 @@ def test_no_emoji_or_long_dashes() -> None:
     assert offenders == []
 
 
-def test_non_ascii_is_cyrillic_or_known_punctuation() -> None:
+STRINGS_FILE = ROOT / "BOT" / "strings.py"
+
+
+def test_text_is_non_ascii_only_in_the_catalog() -> None:
     offenders: list[str] = []
     for path in TEXT_FILES:
         if not path.is_file():
@@ -87,11 +90,40 @@ def test_non_ascii_is_cyrillic_or_known_punctuation() -> None:
                 code = ord(char)
                 if code < 128:
                     continue
-                if 0x0400 <= code <= 0x04FF:
-                    continue
                 if char in ALLOWED_PUNCT:
                     continue
+                if path == STRINGS_FILE:
+                    continue
                 offenders.append(f"{path.relative_to(ROOT)}:{number}: {hex(code)} {unicodedata.name(char, '?')}")
+    assert offenders == []
+
+
+def test_catalog_holds_cyrillic_and_cjk_only() -> None:
+    offenders: list[str] = []
+    for number, line in enumerate(STRINGS_FILE.read_text(encoding="utf-8").splitlines(), start=1):
+        for char in line:
+            code = ord(char)
+            if code < 128 or char in ALLOWED_PUNCT:
+                continue
+            if 0x0400 <= code <= 0x04FF:
+                continue
+            if 0x4E00 <= code <= 0x9FFF:
+                continue
+            if 0x3000 <= code <= 0x303F:
+                continue
+            if 0xFF00 <= code <= 0xFFEF:
+                continue
+            offenders.append(f"{number}: {hex(code)} {unicodedata.name(char, '?')}")
+    assert offenders == []
+
+
+def test_no_shell_script_text_outside_the_catalog() -> None:
+    offenders: list[str] = []
+    for path in AUTHORED_SH:
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            for char in line:
+                if 0x0400 <= ord(char) <= 0x04FF:
+                    offenders.append(f"{path.relative_to(ROOT)}:{number}")
     assert offenders == []
 
 
@@ -108,9 +140,31 @@ def test_no_todo_markers() -> None:
     assert offenders == []
 
 
-def test_vendored_installer_is_left_verbatim() -> None:
-    script = ROOT / "Storage" / "install.sh"
-    again = pathlib.Path("/home/user/free-turn-proxy/scripts/install.sh")
-    assert script.is_file()
-    if again.is_file():
-        assert script.read_bytes() == again.read_bytes()
+
+def test_raise_messages_are_english() -> None:
+    offenders: list[str] = []
+    for path in AUTHORED_PY:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Raise):
+                continue
+            for part in ast.walk(node):
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    for char in part.value:
+                        if 0x0400 <= ord(char) <= 0x04FF:
+                            offenders.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+                            break
+    assert offenders == []
+
+
+def test_no_non_post_quantum_names() -> None:
+    banned = ("vmess", "trojan", "shadowsocks", "httpupgrade", "wireguard", "kcp")
+    offenders: list[str] = []
+    for path in AUTHORED_PY:
+        if path.name in {"test_xray.py", "test_screens.py", "test_xscreens.py", "test_source.py"}:
+            continue
+        text = path.read_text(encoding="utf-8").lower()
+        for name in banned:
+            if name in text:
+                offenders.append(f"{path.relative_to(ROOT)}: {name}")
+    assert offenders == []

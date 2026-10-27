@@ -8,15 +8,16 @@ import os
 import shutil
 import socket
 import subprocess
-import threading
 import time
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from BOT.shell import ShellError, ShellOutput, agent_argv
 from BOT.xrayrpc import (
     DEFAULT_VERSION,
+    agent_code,
     PINNED_SHA256,
     XrayControl,
     XrayError,
@@ -28,7 +29,6 @@ from BOT.xrayrpc import (
     parse_xray_version,
     pinned_digest,
     release_asset,
-    remote_command,
 )
 
 FAKE_CORE = """#!/usr/bin/env python3
@@ -120,8 +120,7 @@ def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
 
 
 def call(*argv: str) -> dict:
-    command = remote_command(list(argv))
-    out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=180)
+    out = subprocess.run(agent_argv(list(argv), agent_code()), capture_output=True, text=True, timeout=180)
     lines = [line for line in out.stdout.splitlines() if line.startswith("{")]
     assert lines, out.stdout + out.stderr
     return json.loads(lines[-1])
@@ -165,12 +164,13 @@ def test_digest_of() -> None:
     assert digest_of("abc") == hashlib.sha256(b"abc").hexdigest()
 
 
-def test_remote_command_is_quoted() -> None:
-    command = remote_command(["probe"])
-    assert "command -v python3" in command
-    assert command.count("'") > 0
-    apply_command = remote_command(["apply", "--config-b64=eyJ9"])
-    assert "--config-b64=eyJ9" in apply_command
+def test_agent_argv_has_no_shell() -> None:
+    argv = agent_argv(["probe"], "print(1)")
+    assert argv[1] == "-c"
+    assert argv[2] == "print(1)"
+    assert argv[3:] == ["probe"]
+    assert not any("sh -c" in item or "bash" in item for item in argv)
+    assert agent_argv(["apply", "--config-b64=eyJ9"], "")[-1] == "--config-b64=eyJ9"
 
 
 def test_parse_response_ok() -> None:
@@ -180,11 +180,11 @@ def test_parse_response_ok() -> None:
 
 
 def test_parse_response_error() -> None:
-    response = parse_response('{"proto":3,"result":"err","code":"download_failed","msg":"нет сети","stage":"download"}')
+    response = parse_response('{"proto":3,"result":"err","code":"download_failed","msg":"no network","stage":"download"}')
     assert response.ok is False
     with pytest.raises(XrayError) as info:
         response.raise_for_status()
-    assert "нет сети" in info.value.message
+    assert "no network" in info.value.message
     assert info.value.code == "download_failed"
 
 
@@ -233,7 +233,7 @@ def test_install_core_rejects_bad_digest(sandbox: dict[str, str]) -> None:
 
 
 def test_install_core_reports_missing_archive(sandbox: dict[str, str]) -> None:
-    body = call("install-core", "--version=v26.10.21", "--url=file:///nonexistent/core.zip", "--sha256=" + "0" * 64)
+    body = call("install-core", "--version=v26.10.21", "--url=file:///tmp/obhod-missing/core.zip", "--sha256=" + "0" * 64)
     assert body["result"] == "err"
     assert body["code"] == "download_failed"
 
@@ -243,7 +243,7 @@ def test_install_core_latest_falls_back_to_pinned(sandbox: dict[str, str]) -> No
         "install-core",
         "--version=latest",
         "--tag=v26.10.21",
-        "--url=file:///nonexistent/latest.zip",
+        "--url=file:///tmp/obhod-missing/latest.zip",
         "--fallback-url=file://" + sandbox["archive"],
         "--fallback-sha256=" + sandbox["digest"],
     )
@@ -251,7 +251,7 @@ def test_install_core_latest_falls_back_to_pinned(sandbox: dict[str, str]) -> No
     assert body["data"]["fallback"] is True
     assert body["data"]["fallback_version"] == "v26.10.21"
     assert body["data"]["version"] == "26.10.21"
-    assert any("фолбек" in line for line in body["logs"])
+    assert any("falling back" in line for line in body["logs"])
     assert Path(sandbox["root"], "usr/local/bin/xray").is_file()
 
 
@@ -266,14 +266,14 @@ def test_install_core_latest_reports_fallback_log(sandbox: dict[str, str]) -> No
     assert body["result"] == "ok", body
     assert body["data"]["fallback"] is False
     assert body["data"]["version"] == "26.10.21"
-    assert any("последний релиз" in line for line in body["logs"])
+    assert any("latest release" in line for line in body["logs"])
 
 
 def test_install_core_pinned_failure_does_not_fallback(sandbox: dict[str, str]) -> None:
-    body = call("install-core", "--version=v26.10.21", "--url=file:///nonexistent/x.zip")
+    body = call("install-core", "--version=v26.10.21", "--url=file:///tmp/obhod-missing/x.zip")
     assert body["result"] == "err"
     assert body["code"] == "download_failed"
-    assert not any("фолбек" in line for line in body["logs"])
+    assert not any("falling back" in line for line in body["logs"])
 
 
 def test_install_core_latest_fails_when_fallback_unreachable(sandbox: dict[str, str]) -> None:
@@ -281,12 +281,12 @@ def test_install_core_latest_fails_when_fallback_unreachable(sandbox: dict[str, 
         "install-core",
         "--version=latest",
         "--tag=v26.10.21",
-        "--url=file:///nonexistent/x.zip",
-        "--fallback-url=file:///nonexistent/pin.zip",
+        "--url=file:///tmp/obhod-missing/x.zip",
+        "--fallback-url=file:///tmp/obhod-missing/pin.zip",
     )
     assert body["result"] == "err"
     assert body["code"] == "download_failed"
-    assert any("фолбек" in line for line in body["logs"])
+    assert any("falling back" in line for line in body["logs"])
 
 
 def test_apply_installs_latest_with_fallback(sandbox: dict[str, str]) -> None:
@@ -302,7 +302,7 @@ def test_apply_installs_latest_with_fallback(sandbox: dict[str, str]) -> None:
         "--config-b64=" + payload(config),
         "--version=latest",
         "--tag=v26.10.21",
-        "--url=file:///nonexistent/latest.zip",
+        "--url=file:///tmp/obhod-missing/latest.zip",
         "--fallback-url=file://" + sandbox["archive"],
         "--fallback-sha256=" + sandbox["digest"],
     )
@@ -425,40 +425,32 @@ def test_bad_base64_payload(sandbox: dict[str, str]) -> None:
 
 
 def test_no_command(sandbox: dict[str, str]) -> None:
-    command = remote_command([])
-    out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=60)
+    out = subprocess.run(agent_argv([], agent_code()), capture_output=True, text=True, timeout=60)
     body = json.loads([line for line in out.stdout.splitlines() if line.startswith("{")][-1])
     assert body["code"] == "bad_arg"
 
 
-def test_no_python_launcher() -> None:
-    command = remote_command(["probe"])
-    out = subprocess.run(
-        ["bash", "-c", "PATH=/nonexistent " + command],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert '"code": "no_python"' in out.stdout or "no_python" in out.stdout
+def test_interpreter_is_absolute() -> None:
+    argv = agent_argv(["probe"], "")
+    assert os.path.isabs(argv[0])
+    assert argv[0].endswith("python3") or argv[0].endswith("python")
 
 
-def test_control_client_over_fake_ssh(sandbox: dict[str, str]) -> None:
-    class FakeSsh:
+def test_control_client_over_fake_shell(sandbox: dict[str, str]) -> None:
+    class FakeShell:
         def __init__(self) -> None:
-            self.commands: list[str] = []
+            self.argv: list[list[str]] = []
 
-        async def run(self, cfg, command, stdin=None, timeout=None):
-            self.commands.append(command)
-            out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=180)
-            from BOT.sshx import SshOutput
-
-            return SshOutput(text=out.stdout.strip(), code=out.returncode)
+        async def run_argv(self, argv, stdin=None, timeout=None):
+            self.argv.append(list(argv))
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=180)
+            return ShellOutput(text=out.stdout.strip(), code=out.returncode)
 
     from BOT.models import SshSettings
 
-    ssh = FakeSsh()
-    control = XrayControl(ssh=ssh)
-    cfg = SshSettings(host="127.0.0.1", user="root", password="x", mode="ROOT")
+    shell = FakeShell()
+    control = XrayControl(shell=shell)
+    cfg = SshSettings()
     state = asyncio.run(control.probe(cfg))
     assert state.installed is False
     assert state.pinned == "v26.10.21"
@@ -469,63 +461,60 @@ def test_control_client_over_fake_ssh(sandbox: dict[str, str]) -> None:
     assert valid is True
     private, public = asyncio.run(control.x25519(cfg))
     assert private == "cHJpdmF0ZQ"
-    assert ssh.commands
+    assert shell.argv
+    for argv in shell.argv:
+        assert isinstance(argv, list)
+        assert argv[1] == "-c"
+        assert "ssh" not in " ".join(argv[:2])
 
 
 def test_control_client_without_core_raises(sandbox: dict[str, str]) -> None:
-    class FakeSsh:
-        async def run(self, cfg, command, stdin=None, timeout=None):
-            from BOT.sshx import SshOutput
-
-            return SshOutput(text='{"proto":3,"result":"err","code":"not_installed","msg":"нет ядра"}', code=1)
+    class FakeShell:
+        async def run_argv(self, argv, stdin=None, timeout=None):
+            return ShellOutput(text='{"proto":3,"result":"err","code":"not_installed","msg":"no core"}', code=1)
 
     from BOT.models import SshSettings
 
-    control = XrayControl(ssh=FakeSsh())
-    cfg = SshSettings(host="127.0.0.1", user="root", password="x", mode="ROOT")
+    control = XrayControl(shell=FakeShell())
+    cfg = SshSettings()
     with pytest.raises(XrayError) as info:
         asyncio.run(control.restart(cfg))
     assert info.value.code == "not_installed"
 
 
 def test_control_client_transport_error() -> None:
-    class FakeSsh:
-        async def run(self, cfg, command, stdin=None, timeout=None):
-            from BOT.sshx import SshError
-
-            raise SshError("нет связи")
+    class FakeShell:
+        async def run_argv(self, argv, stdin=None, timeout=None):
+            raise ShellError("no interpreter")
 
     from BOT.models import SshSettings
 
-    control = XrayControl(ssh=FakeSsh())
-    cfg = SshSettings(host="127.0.0.1", user="root", password="x", mode="ROOT")
+    control = XrayControl(shell=FakeShell())
+    cfg = SshSettings()
     with pytest.raises(XrayError) as info:
         asyncio.run(control.probe(cfg))
     assert info.value.code == "transport"
 
 
-def test_sudo_password_stdin(sandbox: dict[str, str]) -> None:
+def test_no_stdin_payload_is_passed() -> None:
     seen: list[bytes] = []
 
-    class FakeSsh:
-        async def run(self, cfg, command, stdin=None, timeout=None):
+    class FakeShell:
+        async def run_argv(self, argv, stdin=None, timeout=None):
             seen.append(stdin or b"")
-            from BOT.sshx import SshOutput
-
-            return SshOutput(text='{"proto":3,"result":"ok","data":{}}', code=0)
+            return ShellOutput(text='{"proto":3,"result":"ok","data":{}}', code=0)
 
     from BOT.models import SshSettings
 
-    control = XrayControl(ssh=FakeSsh())
-    cfg = SshSettings(host="h", user="root", password="pass", sudo_password="sudo-pass", mode="SUDO_PASS")
-    asyncio.run(control.probe(cfg))
-    assert seen[0] == b"sudo-pass\n"
+    control = XrayControl(shell=FakeShell())
+    asyncio.run(control.probe(SshSettings()))
+    assert seen and all(item == b"" for item in seen)
 
 
 def test_remote_script_has_no_python_comments() -> None:
-    from BOT.xrayrpc import REMOTE_SCRIPT
+    from BOT.xrayrpc import agent_code
 
-    for line in REMOTE_SCRIPT.splitlines():
+    for line in agent_code().splitlines():
         assert not line.strip().startswith("#")
 
 
@@ -546,84 +535,37 @@ def test_wait_for_ports_helper() -> None:
             assert probe_socket.getpeername()[1] == port
 
 
-def test_e2e_over_asyncssh(sandbox: dict[str, str], tmp_path: Path) -> None:
-    import asyncssh
-
+def test_e2e_over_the_local_shell(sandbox: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> None:
     from BOT.models import SshSettings
-    from BOT.sshx import SshClient
+    from BOT.shell import LocalShell
 
-    class Server(asyncssh.SSHServer):
-        def begin_auth(self, username: str) -> bool:
-            return True
+    monkeypatch.setattr("BOT.shell.os.geteuid", lambda: 0)
+    control = XrayControl(shell=LocalShell(command_timeout=180))
+    cfg = SshSettings()
+    initial = asyncio.run(control.probe(cfg))
+    assert initial.installed is False
+    installed = asyncio.run(control.install_core(cfg, url="file://" + sandbox["archive"], sha256=sandbox["digest"]))
+    assert installed.ok is True
+    applied = asyncio.run(control.apply(cfg, json.dumps(GOOD_CONFIG), restart=False))
+    assert applied.config_exists is True
+    valid, _ = asyncio.run(control.test_config(cfg, json.dumps(GOOD_CONFIG)))
+    assert valid is True
+    private, public = asyncio.run(control.x25519(cfg))
+    assert private and public
+    removed = asyncio.run(control.uninstall(cfg, purge=True))
+    assert removed.ok is True
+    final = asyncio.run(control.probe(cfg))
+    assert final.installed is False
 
-        def password_auth_supported(self) -> bool:
-            return True
 
-        def validate_password(self, username: str, password: str) -> bool:
-            return password == "hunter2"
+def test_local_shell_refuses_without_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    from BOT.shell import LocalShell
 
-    async def handle(process: asyncssh.SSHServerProcess) -> None:
-        command = process.command or ""
-        try:
-            payload_bytes = await asyncio.wait_for(process.stdin.read(), 3)
-        except asyncio.TimeoutError:
-            payload_bytes = b""
-        child = await asyncio.create_subprocess_shell(
-            command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await child.communicate(payload_bytes if isinstance(payload_bytes, bytes) else b"")
-        process.stdout.write(out.decode("utf-8", "replace"))
-        process.exit(child.returncode or 0)
-
-    key = asyncssh.generate_private_key("ssh-ed25519")
-    state: dict[str, object] = {}
-    ready = threading.Event()
-
-    def worker() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def main() -> None:
-            closure = asyncio.Event()
-            server = await asyncssh.create_server(Server, "127.0.0.1", 0, server_host_keys=[key], process_factory=handle)
-            state["port"] = server.get_port()
-            state["closure"] = closure
-            ready.set()
-            await closure.wait()
-            server.close()
-            await server.wait_closed()
-
-        loop.run_until_complete(main())
-        loop.close()
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    assert ready.wait(30)
-    try:
-        cfg = SshSettings(host="127.0.0.1", port=int(state["port"]), user="tester", auth="PASSWORD", password="hunter2", mode="ROOT")
-        control = XrayControl(ssh=SshClient(connect_timeout=10, command_timeout=120))
-        initial = asyncio.run(control.probe(cfg))
-        assert initial.installed is False
-        installed = asyncio.run(control.install_core(cfg, url="file://" + sandbox["archive"], sha256=sandbox["digest"]))
-        assert installed.ok is True
-        applied = asyncio.run(control.apply(cfg, json.dumps(GOOD_CONFIG), restart=False))
-        assert applied.config_exists is True
-        valid, _ = asyncio.run(control.test_config(cfg, json.dumps(GOOD_CONFIG)))
-        assert valid is True
-        private, public = asyncio.run(control.x25519(cfg))
-        assert private and public
-        removed = asyncio.run(control.uninstall(cfg, purge=True))
-        assert removed.ok is True
-        final = asyncio.run(control.probe(cfg))
-        assert final.installed is False
-    finally:
-        closure = state.get("closure")
-        if isinstance(closure, asyncio.Event):
-            closure.set()
-        thread.join(timeout=10)
+    monkeypatch.setattr("BOT.shell.os.geteuid", lambda: 1000)
+    shell = LocalShell()
+    with pytest.raises(ShellError) as info:
+        asyncio.run(shell.run_argv(["true"]))
+    assert "root" in info.value.message
 
 
 def test_env_root_prefixing(sandbox: dict[str, str]) -> None:

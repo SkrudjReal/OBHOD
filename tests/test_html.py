@@ -16,7 +16,7 @@ ALLOWED = {
 }
 ATTRS = {
     "data", "type", "text", "url", "style", "align", "open", "href", "class",
-    "bordered", "striped",
+    "bordered", "striped", "query",
 }
 
 
@@ -74,11 +74,17 @@ def test_no_raw_markup_leaks(name: str, html: str) -> None:
 @pytest.mark.parametrize("name,html", render_all(), ids=[item[0] for item in render_all()])
 def test_buttons_have_type_and_payload(name: str, html: str) -> None:
     for tag in re.findall(r"<tg-button [^>]*>", html):
-        assert 'type="callback_data"' in tag or 'type="copy_text"' in tag
+        assert (
+            'type="callback_data"' in tag
+            or 'type="copy_text"' in tag
+            or 'type="switch_inline_query_current_chat"' in tag
+        )
         if 'type="callback_data"' in tag:
             assert "data=" in tag
-        else:
+        elif 'type="copy_text"' in tag:
             assert "text=" in tag
+        else:
+            assert "query=" in tag
 
 
 def test_screen_is_not_empty() -> None:

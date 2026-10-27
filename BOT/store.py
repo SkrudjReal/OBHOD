@@ -7,54 +7,56 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .models import LinkSettings, ServerOptions, SshSettings
-from .xray import XrayState
+from . import i18n
+from .models import SshSettings
+from .xray import SUB_PORT, XrayState
 
 DEFAULT_TAIL = 200
+SCHEMA = 6
+
+
+class StoreError(Exception):
+    pass
 
 
 @dataclass
 class State:
     ssh: SshSettings = field(default_factory=SshSettings)
-    opts: ServerOptions = field(default_factory=ServerOptions)
-    link: LinkSettings = field(default_factory=LinkSettings)
     admin_id: int = 0
-    owner_client_id: str = ""
-    owner_conf: str = ""
     log_tail: int = DEFAULT_TAIL
-    clients: list[dict[str, Any]] = field(default_factory=list)
+    schema: int = SCHEMA
+    sub_port: int = SUB_PORT
     last_probe: dict[str, Any] = field(default_factory=dict)
+    language: str = i18n.DEFAULT_LANGUAGE
     xray: XrayState = field(default_factory=XrayState)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema": int(self.schema),
             "ssh": self.ssh.to_dict(),
-            "opts": self.opts.to_dict(),
-            "link": self.link.to_dict(),
-            "admin_id": self.admin_id,
-            "owner_client_id": self.owner_client_id,
-            "owner_conf": self.owner_conf,
-            "log_tail": self.log_tail,
-            "clients": self.clients,
-            "last_probe": self.last_probe,
+            "admin_id": int(self.admin_id),
+            "log_tail": int(self.log_tail),
+            "sub_port": int(self.sub_port),
+            "last_probe": dict(self.last_probe),
+            "language": i18n.normalize(self.language),
             "xray": self.xray.to_dict(),
         }
 
     @staticmethod
     def from_dict(raw: dict[str, Any] | None) -> "State":
         data = raw or {}
-        return State(
+        state = State(
             ssh=SshSettings.from_dict(data.get("ssh")),
-            opts=ServerOptions.from_dict(data.get("opts")),
-            link=LinkSettings.from_dict(data.get("link")),
             admin_id=int(data.get("admin_id", 0) or 0),
-            owner_client_id=str(data.get("owner_client_id", "")),
-            owner_conf=str(data.get("owner_conf", "")),
             log_tail=int(data.get("log_tail", DEFAULT_TAIL) or DEFAULT_TAIL),
-            clients=list(data.get("clients") or []),
+            schema=int(data.get("schema", SCHEMA) or SCHEMA),
+            sub_port=int(data.get("sub_port", SUB_PORT) or SUB_PORT),
             last_probe=dict(data.get("last_probe") or {}),
+            language=i18n.normalize(data.get("language", i18n.DEFAULT_LANGUAGE)),
             xray=XrayState.from_dict(data.get("xray")),
         )
+        state.xray.sub_port = state.sub_port
+        return state
 
 
 class Store:
@@ -85,7 +87,7 @@ class Store:
                 os.fsync(fh.fileno())
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
-        except OSError:
+        except OSError as exc:
             if os.path.exists(tmp):
                 os.unlink(tmp)
-            raise
+            raise StoreError("the state file could not be written: %s" % exc) from None

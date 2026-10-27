@@ -29,6 +29,19 @@ def _env_file(path: Path) -> dict[str, str]:
     return data
 
 
+LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+
+
+def _float(name: str, raw: str, low: float, high: float) -> float:
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name} must be a number") from None
+    if value != value or value < low or value > high:
+        raise ConfigError(f"{name} must be between {low:g} and {high:g}")
+    return value
+
+
 def _int(name: str, raw: str) -> int:
     try:
         return int(str(raw).strip())
@@ -43,7 +56,6 @@ class Config:
     api_hash: str
     admin_id: int
     state_dir: Path
-    install_script: Path
     session_name: str = "obhod"
     connect_timeout: float = 12.0
     command_timeout: float = 300.0
@@ -87,12 +99,11 @@ class Config:
             raise ConfigError("BOT_TOKEN must look like 123456:ABC-DEF")
 
         state_dir = Path(values.get("OBHOD_STATE_DIR", "/var/lib/obhod"))
-        script = Path(
-            values.get(
-                "OBHOD_INSTALL_SCRIPT",
-                str(Path(__file__).resolve().parent.parent / "Storage" / "install.sh"),
-            )
-        )
+        if not state_dir.is_absolute() or ".." in state_dir.parts:
+            raise ConfigError("OBHOD_STATE_DIR must be a simple absolute path")
+        level = str(values.get("OBHOD_LOG_LEVEL", "INFO")).strip().upper() or "INFO"
+        if level not in LOG_LEVELS:
+            raise ConfigError("OBHOD_LOG_LEVEL must be one of " + ", ".join(LOG_LEVELS))
 
         return Config(
             bot_token=token,
@@ -100,15 +111,14 @@ class Config:
             api_hash=api_hash,
             admin_id=_int("ADMIN_ID", admin_raw) if admin_raw else 0,
             state_dir=state_dir,
-            install_script=script,
             session_name=values.get("OBHOD_SESSION", "obhod"),
-            connect_timeout=float(values.get("OBHOD_CONNECT_TIMEOUT", 12.0)),
-            command_timeout=float(values.get("OBHOD_COMMAND_TIMEOUT", 300.0)),
-            apply_timeout=float(values.get("OBHOD_APPLY_TIMEOUT", 900.0)),
+            connect_timeout=_float("OBHOD_CONNECT_TIMEOUT", values.get("OBHOD_CONNECT_TIMEOUT", 12.0), 1.0, 120.0),
+            command_timeout=_float("OBHOD_COMMAND_TIMEOUT", values.get("OBHOD_COMMAND_TIMEOUT", 300.0), 5.0, 3600.0),
+            apply_timeout=_float("OBHOD_APPLY_TIMEOUT", values.get("OBHOD_APPLY_TIMEOUT", 900.0), 5.0, 3600.0),
             default_dc_host=values.get("OBHOD_DC_HOST") or None,
             default_dc_port=_int("OBHOD_DC_PORT", values["OBHOD_DC_PORT"]) if values.get("OBHOD_DC_PORT") else None,
             env_path=path,
-            log_level=values.get("OBHOD_LOG_LEVEL", "INFO").upper(),
+            log_level=level,
             extra=values,
         )
 
@@ -119,9 +129,3 @@ class Config:
     @property
     def dc_port(self) -> int | None:
         return self.default_dc_port
-
-    def require_install_script(self) -> str:
-        if not self.install_script.is_file():
-            raise ConfigError(f"install script not found at {self.install_script}")
-        raw = self.install_script.read_text(encoding="utf-8", errors="replace")
-        return raw.replace("\r\n", "\n").replace("\r", "\n")

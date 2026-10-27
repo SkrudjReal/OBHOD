@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from BOT import inline
+from BOT import i18n, inline
 from BOT.inline import CANCEL, FIELDS, MARKER, field, clean_value, marker, parse_marker, parse_query, prefill, results_for
 
 import pytest
@@ -9,13 +9,15 @@ from BOT.inline import InlineError
 
 
 def test_field_lookup() -> None:
-    assert field("ssh_host").label == "адрес сервера"
+    assert field("xr_sub_port").label() == i18n.t("FLD_XR_SUB_PORT")
+    assert field("xr_sub_port").label("ru") == i18n.t("FLD_XR_SUB_PORT", "ru")
+    assert field("xr_sub_port").hint("zh") == i18n.t("FLH_XR_SUB_PORT", "zh")
     with pytest.raises(InlineError):
         field("nope")
 
 
 def test_prefill_shape() -> None:
-    assert prefill("ssh_host") == "ob ssh_host - "
+    assert prefill("xr_sub_port") == "ob xr_sub_port - "
     assert prefill("xr_sni", "3") == "ob xr_sni 3 "
     with pytest.raises(InlineError):
         prefill("nope")
@@ -28,13 +30,13 @@ def test_marker_roundtrip() -> None:
 
 
 def test_marker_with_big_value_keeps_spaces() -> None:
-    text = marker("ssh_key", "", "line one two")
-    assert parse_marker(text) == ("ssh_key", "", "line one two")
+    text = marker("ssh_pubkey", "", "line one two")
+    assert parse_marker(text) == ("ssh_pubkey", "", "line one two")
 
 
 def test_marker_unknown_field_is_ignored() -> None:
     assert parse_marker("#ob nope - value") is None
-    assert parse_marker("обычный текст") is None
+    assert parse_marker("plain text") is None
     assert parse_marker("#ob") is None
 
 
@@ -49,8 +51,8 @@ def test_marker_compresses_whitespace() -> None:
 
 
 def test_parse_query_forms() -> None:
-    assert parse_query("ob ssh_host - 1.2.3.4") == ("ssh_host", "", "1.2.3.4")
-    assert parse_query("ob ssh_host 1.2.3.4") == ("ssh_host", "", "1.2.3.4")
+    assert parse_query("ob xr_sub_port - 2096") == ("xr_sub_port", "", "2096")
+    assert parse_query("ob xr_sub_port 2096") == ("xr_sub_port", "2096", "")
     assert parse_query("ob xr_sni 3 www.microsoft.com") == ("xr_sni", "3", "www.microsoft.com")
     assert parse_query("ob") == ("", "", "")
     assert parse_query("other text") is None
@@ -71,9 +73,9 @@ def test_results_for_picker_lists_fields() -> None:
 
 
 def test_results_for_picker_shows_current_values() -> None:
-    results = results_for("ob", current={"ssh_host": "203.0.113.10"})
-    host = next(item for item in results if item["id"] == "pick-ssh_host")
-    assert "203.0.113.10" in host["description"]
+    results = results_for("ob", current={"xr_sub_port": "2096"})
+    item = next(entry for entry in results if entry["id"] == "pick-xr_sub_port")
+    assert "2096" in item["description"]
 
 
 def test_results_for_hint_when_empty_value() -> None:
@@ -92,32 +94,32 @@ def test_results_for_value_produces_marker() -> None:
 
 
 def test_secret_value_is_masked_in_description() -> None:
-    results = results_for("ob ssh_password - hunter2")
-    assert results[0]["description"] == "скрыто"
+    results = results_for("ob xr_mldsa65_seed - abc")
+    assert results[0]["description"] == i18n.t("INL_HIDDEN")
     ids = [item["id"] for item in results]
-    assert "wipe-ssh_password" in ids
+    assert "wipe-xr_mldsa65_seed" in ids
 
 
 def test_plain_value_is_not_masked() -> None:
-    results = results_for("ob ssh_host - 10.1.1.1")
-    assert results[0]["description"] == "10.1.1.1"
+    results = results_for("ob xr_remark - main")
+    assert results[0]["description"] == "main"
 
 
 def test_mt_results_use_tl_shape() -> None:
-    results = results_for("ob ssh_host - 10.1.1.1", src="mt")
+    results = results_for("ob xr_remark - main", src="mt")
     body = results[0]
     assert body["_"] == "inputBotInlineResult"
     assert body["send_message"]["_"] == "inputBotInlineMessageText"
-    assert body["send_message"]["message"] == "#ob ssh_host - 10.1.1.1"
+    assert body["send_message"]["message"] == "#ob xr_remark - main"
     assert body["send_message"]["no_webpage"] is True
     assert "input_message_content" not in body
 
 
 def test_bot_results_use_api_shape() -> None:
-    results = results_for("ob ssh_host - 10.1.1.1", src="bot")
+    results = results_for("ob xr_remark - main", src="bot")
     body = results[0]
     assert body["type"] == "article"
-    assert body["input_message_content"]["message_text"] == "#ob ssh_host - 10.1.1.1"
+    assert body["input_message_content"]["message_text"] == "#ob xr_remark - main"
     assert body["input_message_content"]["disable_web_page_preview"] is True
 
 
@@ -139,7 +141,7 @@ def test_clean_value_length_limit() -> None:
 
 def test_clean_value_keeps_key_newlines() -> None:
     key = "-----BEGIN-----\nabc\n-----END-----"
-    assert clean_value("ssh_key", key) == key
+    assert clean_value("ssh_pubkey", key) == key
 
 
 def test_every_field_has_hint() -> None:
@@ -150,9 +152,11 @@ def test_every_field_has_hint() -> None:
 
 
 def test_secret_fields_are_marked() -> None:
-    secrets = {"ssh_password", "ssh_key", "ssh_sudo", "xr_private_key"}
+    secrets = {"xr_mldsa65_seed"}
     for ident in secrets:
         assert FIELDS[ident].secret is True
+    assert FIELDS["ssh_pubkey"].secret is False
+    assert FIELDS["ssh_new_port"].secret is False
 
 
 def test_marker_prefix_constant() -> None:

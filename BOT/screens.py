@@ -1,20 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
-from goygram.rich import Rich
-
-from .links import core_config, normalize_conf, wg_summary
-from .models import (
-    AUTH_KEY,
-    BACKEND_NEW,
-    CORE_VERSION,
-    CORE_VERSION_LATEST,
-    OBF_PROFILES,
-    ClientInfo,
-    ProbeResult,
-    ShareInfo,
-)
+from . import i18n
+from .guard import BanState, SshState
 from .store import State
 from .ui import (
     big,
@@ -24,9 +14,10 @@ from .ui import (
     code,
     copy_button,
     details,
+    divider,
     heading,
+    inline_button,
     muted,
-    numbered,
     pre,
     quote,
     row,
@@ -34,582 +25,358 @@ from .ui import (
     table,
 )
 
+
 @dataclass
 class View:
     state: State
-    probe: ProbeResult | None = None
-    clients: list[ClientInfo] = field(default_factory=list)
-    share: ShareInfo | None = None
+    core: dict[str, Any] = field(default_factory=dict)
+    ban: BanState | None = None
+    sshd: SshState | None = None
     notice: str = ""
     error: str = ""
+    busy: str = ""
+    lang: str = i18n.DEFAULT_LANGUAGE
+
+    @property
+    def ssh_ready(self) -> bool:
+        return self.state.ssh.is_ready()
+
+    @property
+    def running(self) -> bool:
+        return str(self.core.get("service", "")) == "active"
+
+    @property
+    def installed(self) -> bool:
+        return bool(self.core.get("installed", False))
+
+    @property
+    def clients(self) -> int:
+        return sum(len(item.clients) for item in self.state.xray.inbounds)
+
+    def tr(self) -> i18n.Translator:
+        return i18n.translator(self.lang)
 
 
-def mask(value: str) -> str:
-    if not value:
-        return muted("не задано")
-    return code("*" * min(len(value), 12)) + " " + muted(f"{len(value)} символов")
+def yes_no(lang: str, value: bool) -> str:
+    return i18n.t("UI_YES" if value else "UI_NO", lang)
 
 
-def flag(value: bool, yes: str = "да", no: str = "нет") -> str:
-    return code(yes if value else no)
-
-
-def status_line(view: View) -> str:
-    probe = view.probe
-    if probe is None:
-        return bold("состояние не читано")
-    parts = []
-    parts.append("установлено" if probe.installed else "не установлено")
-    parts.append("запущено" if probe.running else "остановлено")
-    if probe.version:
-        parts.append(probe.version)
-    return bold(", ".join(parts))
-
-
-def banner(view: View) -> list[str]:
+def banner(view: View, t: i18n.Translator) -> list[str]:
     out: list[str] = []
     if view.notice:
         out.append(quote(muted(view.notice)))
     if view.error:
         out.append(quote(bold(view.error)))
+    if view.busy:
+        out.append(quote(muted(view.busy)))
     return out
 
 
-def back_row() -> str:
-    return row(button("Главная", "nav:home"), button("Сервер", "nav:server"))
+def ssh_line(view: View, t: i18n.Translator) -> str:
+    cfg = view.state.ssh
+    mark = t("HOME_SSH_READY") if cfg.is_ready() else t("HOME_SSH_NOT_READY")
+    return bold(t("HOME_SSH_LOCAL", port=cfg.port)) + " " + muted(mark)
 
 
-def home(view: View) -> Rich:
+def core_line(view: View, t: i18n.Translator) -> str:
+    if not view.core:
+        return muted(t("HOME_CORE_UNKNOWN"))
+    if not view.installed:
+        return bold(t("HOME_CORE_MISSING"))
+    state = t("HOME_CORE_RUNNING") if view.running else t("HOME_CORE_STOPPED")
+    ports = ", ".join(str(item) for item in view.core.get("listening") or []) or t("UI_NONE")
+    version = str(view.core.get("version", "") or "")
+    return bold(t("HOME_CORE_STATE", version=version, state=state)) + " " + muted(t("HOME_CORE_PORTS", ports=ports))
+
+
+def home(view: View) -> Any:
+    t = view.tr()
     state = view.state
-    ssh = state.ssh
-    blocks = [
-        f"<p>{status_line(view)}</p>",
-        table(
-            [
-                ("сервер", code(ssh.host or "не задан") + (":" + code(ssh.port) if ssh.host else "")),
-                ("доступ", code("ключ" if ssh.auth == AUTH_KEY else "пароль") if ssh.is_ready() else muted("не настроен")),
-                ("режим root", code(ssh.mode)),
-                ("клиентов", code(len(view.clients))),
-                ("порт входа", code(state.opts.listen_port)),
-                ("обфускация", code(state.opts.obf_profile)),
-            ]
-        ),
+    xray = state.xray
+    blocks = banner(view, t)
+    blocks.append(f"<p>{ssh_line(view, t)}</p>")
+    blocks.append(f"<p>{core_line(view, t)}</p>")
+    pairs = [
+        (t("HOME_LABEL_INBOUNDS"), code(len(xray.inbounds))),
+        (t("HOME_LABEL_CLIENTS"), code(view.clients)),
+        (t("HOME_LABEL_SUBS"), code(t("UI_ON") if xray.sub_enabled else t("UI_OFF"))),
+        (t("HOME_LABEL_FAIL2BAN"), code(t("UI_ON") if xray.fail2ban_enabled else t("UI_OFF"))),
+        (t("HOME_LABEL_PROTOCOL"), code(xray.protocol_label())),
+        (t("HOME_LABEL_ENCRYPTION"), code(xray.encryption_label())),
     ]
-    blocks.extend(banner(view))
+    blocks.append(table(pairs, (t("UI_PARAM"), t("UI_VALUE"))))
+    if xray.inbounds:
+        rows = [(f"{item.id} {item.remark}", f"{item.port} {item.network} {item.security}") for item in xray.inbounds]
+        blocks.append(table(rows, (t("HOME_TABLE_HEADER"), t("HOME_TABLE_HEADER2"))))
     buttons = [
-        big("Сервер", "nav:server", "primary"),
-        big("Xray", "nav:xray"),
-        big("Клиенты", "nav:clients"),
-        row(button("Ссылки", "nav:link"), button("Журнал", "nav:logs")),
-        row(button("Параметры установки", "nav:setup"), button("SSH", "nav:ssh")),
-        row(button("Обслуживание", "nav:maint"), button("Помощь", "nav:help")),
+        row(button(t("NAV_XRAY"), "xr:home"), button(t("NAV_SCANNER"), "xr:scan")),
+        row(button(t("NAV_SUBS"), "xr:subs"), button(t("NAV_CORE"), "xr:core")),
+        row(button(t("NAV_FAIL2BAN"), "nav:ban"), button(t("NAV_SSHD"), "nav:sshd")),
+        row(button(t("NAV_SSH"), "nav:ssh"), button(t("NAV_SETTINGS"), "nav:settings")),
+        row(button(t("NAV_LANGUAGE"), "nav:lang"), button(t("NAV_HELP"), "nav:help")),
     ]
-    return screen("OBHOD", "управление free turn на одном сервере", blocks, buttons, footer=muted("mtproto transport, rich interface"))
+    return screen(t("HOME_TITLE"), t("HOME_SUBTITLE"), blocks, buttons, footer=t("HOME_FOOTER"))
 
 
-def server(view: View) -> Rich:
-    state = view.state
-    opts = state.opts
-    probe = view.probe
-    rows = [
-        ("статус", status_line(view)),
-        ("ssh", code(f"{state.ssh.user}@{state.ssh.host or '-'}:{state.ssh.port}")),
-        ("метод", code(opts.method)),
-        ("backend", code(opts.backend)),
-        ("порт входа", code(opts.listen_port)),
+def language_screen(view: View) -> Any:
+    t = view.tr()
+    blocks = banner(view, t)
+    blocks.append(table([(t("LANG_CURRENT"), code(t("LANG_NAME")))], (t("UI_PARAM"), t("UI_VALUE"))))
+    blocks.append(quote(muted(t("LANG_NOTE"))))
+    buttons = [row(*[button(i18n.t("LANG_NAME", item), f"lang:set:{item}") for item in i18n.LANGUAGES])]
+    buttons.append(row(button(t("UI_HOME"), "nav:home")))
+    return screen(t("LANG_TITLE"), t("LANG_SUBTITLE"), blocks, buttons)
+
+
+def ssh_settings(view: View) -> Any:
+    t = view.tr()
+    cfg = view.state.ssh
+    blocks = banner(view, t)
+    pairs = [
+        (t("SSH_LABEL_MODE"), code(t("SSH_LOCAL_MODE"))),
+        (t("SSH_LABEL_PORT"), code(cfg.port)),
     ]
-    if opts.backend == BACKEND_NEW:
-        rows.append(("wireguard", code(f"{opts.wg_net} udp/{opts.wg_port}")))
-    else:
-        rows.append(("внешний vpn", code(opts.connect or "-")))
-    rows.extend(
+    if view.sshd is not None:
+        pairs.extend(
+            [
+                (t("SSHD_PASSWORD_LOGIN"), code(view.sshd.password_authentication)),
+                (t("SSHD_ROOT"), code(view.sshd.permit_root_login)),
+                (t("SSHD_KEYS"), code(t("SSHD_KEYS_VALUE", count=view.sshd.keys, user=view.sshd.key_user or "root"))),
+            ]
+        )
+    blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
+    blocks.append(quote(muted(t("SSH_NO_PASSWORD"))))
+    buttons = [
+        row(inline_button(t("SSH_LABEL_PORT"), i18n_field("ssh_new_port")), inline_button(t("SSHD_NOTICE_KEY"), i18n_field("ssh_pubkey"))),
+        row(button(t("SSHD_BTN_CHECK"), "sshd:status"), button(t("SSHD_PW_OFF"), "sshd:auth:no")),
+        row(button(t("UI_HOME"), "nav:home")),
+    ]
+    return screen(t("SSH_TITLE"), t("SSH_SUBTITLE"), blocks, buttons)
+
+
+def i18n_field(ident: str, ctx: str = "-") -> str:
+    from . import inline
+
+    return inline.prefill(ident, ctx)
+
+
+def settings(view: View) -> Any:
+    t = view.tr()
+    xray = view.state.xray
+    blocks = banner(view, t)
+    pairs = [
+        (t("SET_CORE_VERSION"), code(xray.version)),
+        (t("SET_LOG_LEVEL"), code(xray.log_level)),
+        (t("SET_SUB_PORT"), code(view.state.sub_port)),
+        (t("SET_SUB_ADDRESS"), code(xray.sub_address or t("UI_NOT_SET"))),
+        (t("SET_TARGETS"), code(len(xray.scan_targets))),
+        (t("SET_SUB_PATH"), code(xray.sub_path_pattern())),
+    ]
+    pairs.extend(
         [
-            ("режим", code(opts.mode)),
-            ("обфускация", code(opts.obf_profile)),
-            ("ключ", mask(opts.obf_key)),
-            ("версия", code(opts.version)),
+            (t("SET_CANDIDATES"), code(len(xray.candidates()))),
+            (t("SET_SCAN_SNI"), code(xray.scan_sni or t("UI_NONE"))),
+            (t("SET_SCAN_XVER"), code(xray.scan_xver)),
+            (t("SET_API_PORT"), code(xray.api_port)),
+            (t("SET_ACCESS_LOG"), code(xray.access_log)),
+            (t("SET_DNS"), code(xray.dns_csv() or t("UI_NONE"))),
+            (t("SET_SSH_BANTIME"), code(xray.fail2ban_ssh_bantime)),
+            (t("SET_SSH_MAXRETRY"), code(str(xray.fail2ban_ssh_maxretry))),
+            (t("SET_IGNOREIP"), code(xray.fail2ban_ignoreip)),
+            (t("SET_SUB_REFRESH"), code(xray.sub_refresh)),
         ]
     )
-    if probe is not None and probe.arch:
-        rows.append(("архитектура", code(probe.arch)))
-    blocks = [table(rows)]
-    if probe is not None and probe.config is not None and probe.config.obf_key:
-        blocks.append(details("конфигурация на сервере", table([
-            ("метод", code(probe.config.method or "-")),
-            ("backend", code(probe.config.backend or "-")),
-            ("порт", code(probe.config.listen_port or "-")),
-            ("ключ", mask(probe.config.obf_key)),
-        ])))
-    blocks.extend(banner(view))
-    apply_label = "Применить конфигурацию" if probe is not None and probe.installed else "Установить на сервер"
+    blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
+    blocks.append(quote(muted(t("SET_NOTE_SUB_PATH"))))
     buttons = [
-        big("Проверить связь и состояние", "srv:check", "primary"),
-        big(apply_label, "srv:apply", "success"),
-        row(button("Остановить", "srv:stop"), button("Перезапустить", "srv:restart")),
-        row(button("Переустановить с нуля", "srv:reset", "danger"), button("Удалить установку", "srv:uninstall", "danger")),
-        row(button("Параметры установки", "nav:setup"), button("SSH", "nav:ssh")),
-        row(button("Журнал", "nav:logs"), button("Обслуживание", "nav:maint")),
-        back_row(),
+        row(button(t("SET_VERSION_PINNED", version=xray.pinned()), "xr:core:ver:pin"), button(t("SET_VERSION_LATEST"), "xr:core:ver:latest")),
+        row(inline_button(t("SET_LOG_LEVEL"), i18n_field("xr_log_level")), inline_button(t("SET_SUB_PORT"), i18n_field("xr_sub_port"))),
+        row(inline_button(t("SET_SUB_ADDRESS"), i18n_field("xr_sub_address")), inline_button(t("SET_CANDIDATES"), i18n_field("xr_scan_candidates"))),
+        row(inline_button(t("SET_API_PORT"), i18n_field("xr_api_port")), inline_button(t("SET_ACCESS_LOG"), i18n_field("xr_access_log"))),
+        row(inline_button(t("SET_DNS"), i18n_field("xr_dns_servers")), button(t("NAV_LANGUAGE"), "nav:lang")),
+        row(button(t("UI_HOME"), "nav:home")),
     ]
-    return screen("Сервер", "все действия идут через install.sh по ssh", blocks, buttons)
+    return screen(t("SET_TITLE"), t("SET_SUBTITLE"), blocks, buttons)
 
 
-def ssh_settings(view: View) -> Rich:
-    ssh = view.state.ssh
-    rows = [
-        ("хост", code(ssh.host or "не задан")),
-        ("порт", code(ssh.port)),
-        ("пользователь", code(ssh.user)),
-        ("вход по", code("ключу" if ssh.auth == AUTH_KEY else "паролю")),
-        ("пароль", mask(ssh.password)),
-        ("ключ", mask(ssh.key)),
-        ("пароль ключа", mask(ssh.passphrase)),
-        ("пароль sudo", mask(ssh.sudo_password)),
-        ("режим root", code(ssh.mode)),
-        ("отпечаток", code(ssh.fingerprint[:26] + "...") if ssh.fingerprint else muted("не сохранен")),
+def ban_screen(view: View) -> Any:
+    t = view.tr()
+    xray = view.state.xray
+    blocks = banner(view, t)
+    ban = view.ban
+    pairs = [
+        (t("FB_ENABLED_BOT"), code(yes_no(view.lang, xray.fail2ban_enabled))),
+        (t("FB_JAIL"), code(xray.fail2ban_jail)),
+        (t("FB_BANTIME"), code(t("FB_MINUTES", value=xray.fail2ban_bantime))),
+        (t("FB_SSH_BANTIME"), code(xray.fail2ban_ssh_bantime)),
+        (t("FB_SSH_MAXRETRY"), code(str(xray.fail2ban_ssh_maxretry))),
+        (t("FB_IGNOREIP"), code(xray.fail2ban_ignoreip)),
     ]
-    blocks = [
-        table(rows),
-        quote(muted("пароли и ключи лежат в state.json с правами 600 и никогда не попадают в сообщения")),
-    ]
-    blocks.extend(banner(view))
-    buttons = [
-        big("Изменить адрес сервера", "ssh:edit:ssh_host", "primary"),
-        row(button("Порт", "ssh:edit:ssh_port"), button("Пользователь", "ssh:edit:ssh_user")),
-        row(button("Пароль", "ssh:edit:ssh_password"), button("Ключ", "ssh:edit:ssh_key")),
-        row(button("Пароль ключа", "ssh:edit:ssh_passphrase"), button("Пароль sudo", "ssh:edit:ssh_sudo")),
-        row(button("Сменить способ входа", "ssh:togglemode"), button("Сбросить отпечаток", "ssh:clearfp")),
-        row(button("Проверить связь", "srv:check"), button("Главная", "nav:home")),
-    ]
-    return screen("Доступ по SSH", "бот входит на сервер и запускает install.sh", blocks, buttons)
-
-
-def setup(view: View) -> Rich:
-    opts = view.state.opts
-    rows = [
-        ("backend", code("свой wireguard" if opts.backend == BACKEND_NEW else "внешний vpn")),
-        ("метод", code(opts.method)),
-        ("порт входа", code(opts.listen_port)),
-        ("режим", code(opts.mode)),
-        ("обфускация", code(opts.obf_profile)),
-        ("ключ", mask(opts.obf_key)),
-        ("версия", code(opts.version)),
-    ]
-    if opts.backend == BACKEND_NEW:
-        rows.append(("wireguard", code(f"{opts.wg_net} udp/{opts.wg_port}")))
-    else:
-        rows.append(("внешний vpn", code(opts.connect or "не задан")))
-    rows.append(("адрес в ссылке", code(opts.host or view.state.ssh.host or "не задан")))
-    blocks = [
-        table(rows),
-        quote(muted("свой wireguard поднимается на сервере, внешний vpn уже работает вне бота")),
-        quote(muted("версия ядра закреплена: " + CORE_VERSION + " ставится по умолчанию, latest только по выбору")),
-    ]
-    if opts.backend == BACKEND_NEW and opts.mode != "udp":
-        blocks.append(quote(bold("свой wireguard работает только в режиме udp")))
-    blocks.extend(banner(view))
-    buttons = [
-        row(button("Свой wireguard", "setup:backend:new"), button("Внешний vpn", "setup:backend:external")),
-        row(button("docker", "setup:method:docker"), button("systemd", "setup:method:systemd")),
-        row(button("udp", "setup:mode:udp"), button("tcp", "setup:mode:tcp")),
-        row(button("Порт входа", "setup:edit:setup_listen"), button("Порт wg", "setup:edit:setup_wgport")),
-        row(button("Подсеть wg", "setup:edit:setup_wgnet"), button("Адрес vpn", "setup:edit:setup_connect")),
-        row(button("Обфускация", "setup:obf:menu"), button("Адрес в ссылке", "setup:edit:setup_host")),
-        row(
-            button("Версия " + CORE_VERSION, "setup:ver:" + CORE_VERSION),
-            button("Версия " + CORE_VERSION_LATEST, "setup:ver:" + CORE_VERSION_LATEST),
-        ),
-        row(button("Своя версия", "setup:edit:setup_version"), button("Сгенерировать ключ", "setup:genkey")),
-        back_row(),
-    ]
-    return screen("Параметры установки", "те же поля, что в мобильном клиенте", blocks, buttons)
-
-
-def obf_menu(view: View) -> Rich:
-    current = view.state.opts.obf_profile
-    rows = []
-    for name in OBF_PROFILES:
-        mark = "текущий" if name == current else "выбрать"
-        if name == "none":
-            rows.append(button("none, без маскировки", "setup:obf:none"))
-        else:
-            rows.append(button(f"{name}, {mark}", f"setup:obf:{name}"))
-    blocks = [
-        bullet_list(
+    if ban is not None:
+        pairs.extend(
             [
-                bold("rtpopus3") + " " + muted("rtp/opus, расширения rfc 8285, имитация речи и потерь"),
-                bold("rtpopus2") + " " + muted("rtp/opus с базовым заголовком расширений"),
-                bold("rtpopus") + " " + muted("простой rtp/opus заголовок"),
-                bold("none") + " " + muted("без маскировки, подходит только для тестов"),
+                (t("FB_SERVER"), code(yes_no(view.lang, ban.installed))),
+                (t("FB_JAIL_ACTIVE"), code(yes_no(view.lang, ban.active))),
+                (t("FB_JAILS"), code(", ".join(ban.jails) or t("UI_NONE"))),
+                (t("FB_SUB_JAIL"), code(ban.sub_jail)),
+                (t("FB_CHAIN"), code(ban.chain)),
+                (t("FB_RULES"), code(len(ban.chain_rules))),
             ]
-        ),
-        quote(muted("профиль и ключ должны совпадать на сервере и в ссылке клиента")),
-    ]
-    blocks.extend(banner(view))
-    buttons = [rows[0], rows[1], rows[2], rows[3], back_row()]
-    return screen("Обфускация", "ключ: " + mask(view.state.opts.obf_key), blocks, buttons)
-
-
-def clients(view: View) -> Rich:
-    blocks: list[str] = []
-    if not view.clients:
-        blocks.append(quote(muted("список пуст, обновите его или добавьте клиента")))
-    else:
-        rows = []
-        for item in view.clients[:10]:
-            label = item.name + (" (owner)" if item.is_self else "")
-            rows.append((label, code(item.ip or "-") + " " + (muted("handshake") if item.handshake else muted("без handshake"))))
-        blocks.append(table(rows))
-    if view.share is not None and view.share.host:
-        blocks.append(details("параметры выдачи", table([
-            ("backend", code(view.share.backend or "-")),
-            ("адрес", code(f"{view.share.host}:{view.share.port}")),
-            ("режим", code(view.share.mode or "-")),
-            ("обфускация", code(view.share.obf_profile or "-")),
-        ])))
-    blocks.extend(banner(view))
-    buttons = [big("Добавить клиента", "cli:add", "success"), big("Обновить список", "cli:refresh", "primary")]
-    links = [button(item.name, f"cli:open:{item.name}") for item in view.clients[:8]]
-    while links:
-        chunk, links = links[:3], links[3:]
-        buttons.append(row(*chunk))
-    buttons.append(back_row())
-    return screen("Клиенты", "allowlist и выдача ссылок", blocks, buttons)
-
-
-def client(view: View, name: str) -> Rich:
-    item = next((entry for entry in view.clients if entry.name == name), ClientInfo(name=name))
-    rows = [
-        ("имя", code(item.name)),
-        ("client id", code(item.client_id or "-")),
-        ("признак", code("owner" if item.is_self else "client")),
-        ("адрес пира", code(item.ip or "-")),
-        ("публичный ключ", code(item.pub[:24] + "...") if item.pub else muted("нет")),
-        ("handshake", code(item.handshake)),
-    ]
-    blocks = [table(rows)]
-    blocks.extend(banner(view))
-    buttons = [
-        big("Ссылка freeturn", f"cli:link:{name}", "primary"),
-        big("Конфигурация wireguard", f"cli:wg:{name}"),
-        big("Снимок конфигурации ядра", f"cli:cfg:{name}"),
-        row(button("Удалить", f"cli:del:{name}"), button("К клиентам", "nav:clients")),
-    ]
-    return screen(name, "клиент free turn", blocks, buttons)
-
-
-def confirm_remove(view: View, name: str) -> Rich:
-    blocks = [
-        bold("удаление необратимо"),
-        bullet_list(
-            [
-                "клиент исчезнет из allowlist на сервере",
-                "его пир будет вырезан из wireguard",
-                "выданная ему ссылка перестанет работать",
-            ]
-        ),
-        table([("клиент", code(name))]),
-    ]
-    blocks.extend(banner(view))
-    buttons = [
-        row(button("Удалить клиента", f"cli:del2:{name}", "danger"), button("Отмена", f"cli:open:{name}")),
-    ]
-    return screen("Подтверждение", "удаляем " + name, blocks, buttons)
-
-
-def confirm_reset(view: View) -> Rich:
-    opts = view.state.opts
-    blocks = [
-        bold("переустановка с нуля"),
-        bullet_list(
-            [
-                "останавливается и удаляется контейнер и systemd юнит",
-                "удаляется интерфейс ft-wg0 со всеми пирами",
-                "завершаются процессы ядра",
-                "удаляется каталог /opt/free-turn-proxy целиком",
-                "ядро скачивается заново и ставится пустым",
-            ]
-        ),
-        table(
-            [
-                ("версия ядра", code(opts.version)),
-                ("метод", code(opts.method)),
-                ("backend", code(opts.backend)),
-                ("порт входа", code(opts.listen_port)),
-            ]
-        ),
-        quote(muted("существующие клиентские пиры и ссылки перестанут работать")),
-    ]
-    blocks.extend(banner(view))
-    buttons = [
-        big("Удалить все и поставить заново", "maint:reset2", "danger"),
-        row(button("Отмена", "nav:maint"), button("Сервер", "nav:server")),
-    ]
-    return screen("Подтверждение", "сервер очищается полностью", blocks, buttons)
-
-
-def confirm_uninstall(view: View, action: str = "maint:uninstall2") -> Rich:
-    blocks = [
-        bold("удаление установки"),
-        bullet_list(
-            [
-                "останавливается сервис free turn proxy",
-                "удаляется свой интерфейс wireguard и его пиры",
-                "удаляются каталог установки и правила firewall",
-            ]
-        ),
-        quote(muted("бот и его настройки остаются на месте")),
-    ]
-    blocks.extend(banner(view))
-    buttons = [
-        row(button("Удалить установку", action, "danger"), button("Отмена", "nav:maint")),
-    ]
-    return screen("Подтверждение", "удаляем сервер целиком", blocks, buttons)
-
-
-def link_settings(view: View) -> Rich:
-    state = view.state
-    link = state.link
-    rows = [
-        ("потоки", code(link.threads)),
-        ("потоков на креды", code(link.streams_per_cred)),
-        ("транспорт turn", code(link.transport)),
-        ("режим", code(link.mode)),
-        ("bond", flag(link.bond)),
-        ("задержка", code(f"{link.timing_ms} ms")),
-        ("локальный адрес", code(link.local_listen)),
-        ("dns режим", code(link.dns_mode)),
-        ("dns серверы", code(link.dns_servers or "оператора")),
-        ("ручная captcha", flag(link.manual_captcha)),
-        ("ссылка на звонок", code(link.call_link[:40]) if link.call_link else muted("не задана")),
-    ]
-    blocks = [
-        table(rows),
-        quote(muted("эти значения попадают в ссылку freeturn и применяются клиентом на устройстве")),
-    ]
-    blocks.extend(banner(view))
-    buttons = [
-        row(button("Потоки", "lnk:edit:link_threads"), button("На креды", "lnk:edit:link_spc")),
-        row(button("Транспорт", "lnk:cycle:transport"), button("Режим", "lnk:cycle:mode")),
-        row(button("Bond", "lnk:toggle:bond"), button("Задержка", "lnk:edit:link_timing")),
-        row(button("Локальный адрес", "lnk:edit:link_listen"), button("DNS режим", "lnk:cycle:dns")),
-        row(button("DNS серверы", "lnk:edit:link_dnss"), button("Ручная captcha", "lnk:toggle:mcap")),
-        big("Ссылка на звонок", "lnk:edit:link_call"),
-        row(button("Клиенты", "nav:clients"), button("Главная", "nav:home")),
-    ]
-    return screen("Параметры подключения", "как в мобильном клиенте", blocks, buttons)
-
-
-def link_screen(view: View, name: str, link: str, conf: str, client_info: ClientInfo) -> Rich:
-    blocks = [
-        pre(link),
-        row(copy_button("Скопировать ссылку", link)),
-        table(
-            [
-                ("клиент", code(name)),
-                ("client id", code(client_info.client_id or "-")),
-                ("адрес", code(client_info.ip or "-")),
-                ("длина", code(len(link))),
-            ]
-        ),
-        quote(muted("ссылка работает и на android, и на ios, других форматов больше нет")),
-    ]
-    if conf:
-        summary = wg_summary(conf)
-        blocks.append(details("wireguard внутри ссылки", table(summary.fields)))
-    blocks.extend(banner(view))
-    buttons = [
-        row(button("Клиенты", "nav:clients"), button("Обновить", f"cli:link:{name}")),
-        row(button("Параметры ссылки", "nav:link"), button("Главная", "nav:home")),
-    ]
-    return screen("Ссылка доступа", name, blocks, buttons)
-
-
-def wg_screen(view: View, name: str, conf: str, client_info: ClientInfo) -> Rich:
-    summary = wg_summary(conf)
-    blocks = [
-        pre(normalize_conf(conf)),
-        details("разбор", table(summary.fields)),
-        row(copy_button("Скопировать конфигурацию", normalize_conf(conf))),
-    ]
-    blocks.extend(banner(view))
-    buttons = [
-        row(button("Назад к клиенту", f"cli:open:{name}"), button("Главная", "nav:home")),
-    ]
-    return screen("WireGuard", name, blocks, buttons)
-
-
-def config_screen(view: View, name: str) -> Rich:
-    state = view.state
-    client_id = state.owner_client_id if name == "owner" else ""
-    if not client_id:
-        item = next((entry for entry in view.clients if entry.name == name), None)
-        client_id = item.client_id if item is not None else ""
-    body = core_config(state.ssh, state.opts, state.link, client_id, bool(state.owner_conf))
-    import json
-
-    blocks = [
-        pre(json.dumps(body, ensure_ascii=False, indent=2), "json"),
-        quote(muted("ровно то, что ядро получает на устройстве при запуске")),
-    ]
-    blocks.extend(banner(view))
-    buttons = [row(button("Назад к клиенту", f"cli:open:{name}"), button("Главная", "nav:home"))]
-    return screen("Конфигурация ядра", name, blocks, buttons)
-
-
-def logs(view: View, lines: list[str], tail: int) -> Rich:
-    body = "\n".join(lines) if lines else "журнал пуст"
-    blocks = [
-        pre(body[-3500:]),
-        table([("строк", code(len(lines))), ("запрошено", code(tail))]),
-    ]
-    blocks.extend(banner(view))
-    buttons = [
-        row(button("50", "log:tail:50"), button("200", "log:tail:200"), button("500", "log:tail:500")),
-        big("Обновить", "log:refresh", "primary"),
-        row(button("Сервер", "nav:server"), button("Главная", "nav:home")),
-    ]
-    return screen("Журнал сервера", "journalctl или docker logs", blocks, buttons)
-
-
-def maintenance(view: View) -> Rich:
-    opts = view.state.opts
-    blocks = [
-        table(
-            [
-                ("версия ядра", code(opts.version)),
-                ("метод", code(opts.method)),
-                ("backend", code(opts.backend)),
-                ("каталог на сервере", code("/opt/free-turn-proxy")),
-            ]
-        ),
-        bullet_list(
-            [
-                bold("обновить ядро") + " " + muted("скачать закрепленную версию и перезапустить сервис"),
-                bold("переустановить с нуля") + " " + muted("снести установку, интерфейсы и процессы, поставить заново"),
-                bold("перезапустить") + " " + muted("мягкий рестарт сервиса"),
-                bold("удалить установку") + " " + muted("полный снос сервера, бот остается"),
-            ]
-        ),
-    ]
-    blocks.extend(banner(view))
-    buttons = [
-        big("Обновить ядро", "maint:update", "primary"),
-        big("Переустановить с нуля", "maint:reset", "danger"),
-        big("Перезапустить", "maint:restart"),
-        big("Удалить установку", "maint:uninstall", "danger"),
-        back_row(),
-    ]
-    return screen("Обслуживание", "то, что не входит в повседневную работу", blocks, buttons)
-
-
-def help_screen(view: View) -> Rich:
-    blocks = [
-        heading("Как это работает", 3),
-        numbered(
-            [
-                "бот входит на ваш сервер по ssh и запускает install.sh",
-                "ядро free turn proxy слушает udp порт и ждет turn трафик",
-                "клиент на устройстве поднимает локальный wireguard и завернут в rtp/opus",
-                "сервер проверяет client id по allowlist и релеит пакеты в wireguard",
-            ]
-        ),
-        heading("Что нужно один раз", 3),
-        bullet_list(
-            [
-                "доступ по ssh, ключ или пароль, root или sudo",
-                "параметры установки, порт, режим, обфускация",
-                "ссылка на звонок, если провайдер turn требует ее для выдачи кредов",
-            ]
-        ),
-        heading("Ссылка freeturn", 3),
-        bullet_list(
-            [
-                "одна ссылка на android и ios, отдельных сборок больше нет",
-                "внутри адрес, ключ обфускации, конфигурация wireguard и client id",
-                "ссылку нельзя публиковать, она равносильна ключам доступа",
-            ]
-        ),
+        )
+    blocks.append(table(pairs, (t("UI_PARAM"), t("UI_VALUE"))))
+    if ban is not None:
+        blocks.append(f"<p>{t('FB_BANNED', ips=code(', '.join(ban.banned) or t('UI_NONE')))}</p>")
+        blocks.append(f"<p>{t('FB_BANNED_SSH', ips=code(', '.join(ban.ssh_banned) or t('UI_NONE')))}</p>")
+        blocks.append(f"<p>{t('FB_BANNED_SUB', ips=code(', '.join(ban.sub_banned) or t('UI_NONE')))}</p>")
+        if ban.chain_rules:
+            blocks.append(pre("\n".join(ban.chain_rules[:12])))
+    blocks.append(
         details(
-            "Команды install.sh, которые использует бот",
-            table(
-                [
-                    ("probe", code("состояние узла")),
-                    ("apply", code("установка и применение")),
-                    ("stop, restart", code("управление сервисом")),
-                    ("logs", code("журнал сервиса")),
-                    ("client-list", code("список клиентов")),
-                    ("client-add", code("новый клиент")),
-                    ("client-conf", code("конфигурация клиента")),
-                    ("client-remove", code("отзыв доступа")),
-                    ("uninstall", code("снос установки")),
-                ]
-            ),
-        ),
-        details(
-            "Порты по умолчанию",
+            t("FB_HOW_TITLE"),
             bullet_list(
                 [
-                    "вход ядра: udp " + code(view.state.opts.listen_port),
-                    "wireguard: " + code(f"127.0.0.1:{view.state.opts.wg_port}"),
-                    "подсеть wireguard: " + code(view.state.opts.wg_net),
-                    "клиент слушает " + code(view.state.link.local_listen),
+                    t("FB_HOW_LOG", path=code(xray.access_log)),
+                    t("FB_HOW_LINE", line=code("[LIMIT_IP] Email = ... || Disconnecting OLD IP = ... || Timestamp = ...")),
+                    t("FB_HOW_LIMITS"),
+                    t("FB_HOW_PORTS"),
                 ]
             ),
-        ),
+        )
+    )
+    buttons = [
+        row(button(t("FB_BTN_ENABLE"), "fb:install"), button(t("FB_BTN_CHECK"), "fb:status")),
+        row(inline_button(t("FB_BANTIME"), i18n_field("xr_bantime")), inline_button(t("FB_IP_FIELD"), i18n_field("xr_ban_ip"))),
+        row(inline_button(t("SET_SSH_BANTIME"), i18n_field("xr_ssh_bantime")), inline_button(t("SET_SSH_MAXRETRY"), i18n_field("xr_ssh_maxretry"))),
+        row(inline_button(t("SET_IGNOREIP"), i18n_field("xr_ignoreip"))),
+        row(button(t("FB_BTN_RESET"), "fb:reset"), button(t("FB_BTN_DISABLE"), "fb:remove")),
+        row(button(t("UI_HOME"), "nav:home")),
     ]
-    blocks.extend(banner(view))
-    buttons = [big("Импорт ссылки", "nav:import", "primary"), back_row()]
-    return screen("Помощь", "как устроен транспорт и управление", blocks, buttons)
+    return screen(t("FB_TITLE"), t("FB_SUBTITLE"), blocks, buttons)
 
 
-def import_screen(view: View, rows: list[tuple[str, str]] | None = None, raw: str = "", error: str = "") -> Rich:
-    blocks = [quote(muted("отправьте ссылку freeturn одним сообщением, бот разберет ее без подключения"))]
-    if rows:
-        blocks.append(table(rows))
-    if raw:
-        blocks.append(pre(raw))
-        blocks.append(row(copy_button("Скопировать ссылку", raw)))
-    if error:
-        blocks.append(quote(bold(error)))
-    blocks.extend(banner(view))
-    buttons = [row(button("Ссылки", "nav:link"), button("Главная", "nav:home"))]
-    return screen("Импорт ссылки", "разбор без установки", blocks, buttons)
+def sshd_screen(view: View) -> Any:
+    t = view.tr()
+    blocks = banner(view, t)
+    item = view.sshd
+    if item is None:
+        blocks.append(quote(muted(t("SSHD_NOT_READ"))))
+    else:
+        pairs = [
+            (t("SSHD_PORTS"), code(", ".join(str(port) for port in item.ports))),
+            (t("SSHD_ROOT"), code(item.permit_root_login)),
+            (t("SSHD_PASSWORD_LOGIN"), code(item.password_authentication)),
+            (t("FB_JAIL"), code(t("SSHD_RISK_OFF") if item.password_authentication == "no" else t("SSHD_RISK_ON"))),
+            (t("SSHD_KEY_LOGIN"), code(item.pubkey_authentication)),
+            (t("SSHD_SERVICE"), code(item.service)),
+            (t("SSHD_BINARY"), code(yes_no(view.lang, item.sshd))),
+            (t("SSHD_CONFIG"), code(item.config)),
+            (t("SSHD_KEYS"), code(t("SSHD_KEYS_VALUE", count=item.keys, user=item.key_user or "root"))),
+        ]
+        blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
+        state = t("SSHD_CREATED") if item.dropin_exists else t("SSHD_NOT_CREATED")
+        blocks.append(f"<p>{t('SSHD_DROPIN', path=code(item.dropin), state=muted(state))}</p>")
+    buttons = [
+        row(button(t("SSHD_BTN_CHECK"), "sshd:status")),
+        row(inline_button(t("SSHD_NEW_PORT"), i18n_field("ssh_new_port")), inline_button(t("SSHD_PUBKEY"), i18n_field("ssh_pubkey"))),
+        row(button(t("SSHD_PW_OFF"), "sshd:auth:no"), button(t("SSHD_PW_ON"), "sshd:auth:yes")),
+        row(button(t("SSHD_ROOT_KEY"), "sshd:root:prohibit-password"), button(t("SSHD_ROOT_OFF"), "sshd:root:no")),
+        row(button(t("SSHD_REMOVE"), "sshd:remove"), button(t("UI_HOME"), "nav:home")),
+    ]
+    return screen(t("SSHD_TITLE"), t("SSHD_SUBTITLE"), blocks, buttons, footer=t("SSHD_FOOTER"))
 
 
-def prompt(spec: object, error: str = "") -> Rich:
-    label = getattr(spec, "label", "Значение")
-    text = getattr(spec, "prompt", "отправьте значение")
-    hint = getattr(spec, "hint", "")
-    blocks = [f"<p>{text}</p>"]
-    if hint:
-        blocks.append(quote(muted(hint)))
-    if error:
-        blocks.append(quote(bold(error)))
-    blocks.append(quote(muted("сообщение с секретом бот не показывает в списке чатов, но оно остается на серверах telegram")))
-    buttons = [row(button("Отмена", "nav:home"), button("Главная", "nav:home"))]
-    return screen(label, "ожидается текст", blocks, buttons)
+def help_screen(view: View) -> Any:
+    t = view.tr()
+    blocks = banner(view, t)
+    blocks.append(heading(t("HELP_WHAT_TITLE"), 3))
+    blocks.append(
+        bullet_list(
+            [
+                t("HELP_WHAT_1", protocol=code("vless"), networks=" ".join(code(item) for item in ("raw", "grpc", "xhttp"))),
+                t("HELP_WHAT_2", security=" ".join(code(item) for item in ("reality", "tls", "none"))),
+                t("HELP_WHAT_3", encryption=code("mlkem768x25519plus"), signature=code("ml-dsa-65")),
+                t("HELP_WHAT_4"),
+                t("HELP_WHAT_5", path=code("/<64>/<64>")),
+                t("HELP_WHAT_6"),
+            ]
+        )
+    )
+    blocks.append(heading(t("HELP_FLOW_TITLE"), 3))
+    blocks.append(bullet_list([t("HELP_FLOW_1"), t("HELP_FLOW_2"), t("HELP_FLOW_3"), t("HELP_FLOW_4")]))
+    buttons = [row(button(t("UI_HOME"), "nav:home"), button(t("NAV_XRAY"), "xr:home"))]
+    return screen(t("HELP_TITLE"), t("HELP_SUBTITLE"), blocks, buttons)
 
 
-def busy_screen(title: str, step: str = "") -> Rich:
-    blocks = [f"<p>{bold(title)}</p>"]
-    if step:
-        blocks.append(f"<p>{step}</p>")
-    blocks.append(muted("дождитесь результата, кнопки вернутся в следующем сообщении"))
-    return screen("Выполняется", "операция на сервере", blocks, [])
+def denied(lang: str = i18n.DEFAULT_LANGUAGE) -> Any:
+    t = i18n.translator(lang)
+    return screen(t("DENIED_TITLE"), "", [quote(bold(t("DENIED_BODY")))], [])
 
 
-def error_screen(view: View, title: str, message: str) -> Rich:
+def error_screen(view: View, title: str, message: str) -> Any:
+    t = view.tr()
     blocks = [quote(bold(message))]
-    blocks.extend(banner(view))
-    buttons = [row(button("Сервер", "nav:server"), button("Главная", "nav:home"))]
-    return screen(title, "операция не выполнена", blocks, buttons)
+    buttons = [row(button(t("UI_HOME"), "nav:home"), button(t("NAV_XRAY"), "xr:home"))]
+    return screen(title, t("UI_ACTION_FAILED"), blocks, buttons)
 
 
-def denied() -> Rich:
-    blocks = [quote(bold("бот обслуживает только своего администратора"))]
-    return screen("Доступ закрыт", "чужие команды игнорируются", blocks, [])
+def busy_screen(title: str, lang: str = i18n.DEFAULT_LANGUAGE, steps: list[str] | None = None) -> Any:
+    t = i18n.translator(lang)
+    blocks = [quote(muted(title))]
+    if steps:
+        blocks.append(bullet_list([muted(item) for item in steps]))
+    return screen(t("BUSY_TITLE"), t("BUSY_SUBTITLE"), blocks, [])
 
 
-def void() -> Rich:
-    return screen("Готово", "сообщение обновлено", [], [row(button("Главная", "nav:home"))])
+def prompt(ident: str, lang: str = i18n.DEFAULT_LANGUAGE, error: str = "") -> Any:
+    from . import inline
+
+    t = i18n.translator(lang)
+    item = inline.field(ident)
+    blocks: list[str] = []
+    if error:
+        blocks.append(quote(bold(error)))
+    blocks.append(
+        table(
+            [(t("UI_FIELD"), code(item.label(lang))), (t("UI_HINT"), muted(item.hint(lang)))],
+            (t("UI_FIELD"), t("UI_VALUE")),
+        )
+    )
+    if item.example:
+        blocks.append(f"<p>{t('PROMPT_EXAMPLE', example=code(item.example))}</p>")
+    buttons = [row(inline_button(t("PROMPT_INPUT"), inline.prefill(ident)), button(t("UI_CANCEL"), "nav:home"))]
+    return screen(t("PROMPT_TITLE"), item.label(lang), blocks, buttons)
+
+
+def confirm(title: str, body: str, action: str, lang: str = i18n.DEFAULT_LANGUAGE, back: str = "nav:home") -> Any:
+    t = i18n.translator(lang)
+    blocks = [quote(bold(body))]
+    buttons = [row(button(t("UI_CONFIRM"), action), button(t("UI_CANCEL"), back))]
+    return screen(title, t("UI_ACTION_IRREVERSIBLE"), blocks, buttons)
+
+
+def logs_screen(view: View, lines: list[str], tail: int) -> Any:
+    t = view.tr()
+    blocks = banner(view, t)
+    blocks.append(f"<p>{t('LOGS_LAST', count=code(tail))}</p>")
+    blocks.append(pre("\n".join(lines) or t("UI_EMPTY")))
+    buttons = [
+        row(button("50", "xr:logs:50"), button("200", "xr:logs:200"), button("500", "xr:logs:500")),
+        row(button(t("UI_REFRESH"), f"xr:logs:{tail}"), button(t("UI_HOME"), "nav:home")),
+    ]
+    return screen(t("LOGS_TITLE"), t("LOGS_SUBTITLE"), blocks, buttons)
+
+
+def guard_rows(view: View) -> str:
+    t = view.tr()
+    return divider() + row(big(t("NAV_FAIL2BAN"), "nav:ban"), big(t("NAV_SSHD"), "nav:sshd"))
+
+
+def subscription_hint(path: str, url: str, lang: str = i18n.DEFAULT_LANGUAGE) -> Any:
+    t = i18n.translator(lang)
+    blocks = [
+        f"<p>{t('SUB_LABEL_PATH', path=code(path))}</p>",
+        pre(url),
+        quote(muted(t("SUB_NOTE"))),
+    ]
+    buttons = [row(copy_button(t("SUB_COPY"), url)), row(button(t("UI_HOME"), "nav:home"))]
+    return screen(t("SUB_TITLE"), t("SUB_SUBTITLE"), blocks, buttons)

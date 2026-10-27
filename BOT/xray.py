@@ -4,32 +4,64 @@ import base64
 import json
 import re
 import secrets
+import string
 import uuid as uuidlib
 from dataclasses import dataclass, field
 from typing import Any
 
-PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks")
-NETWORKS = ("tcp", "ws", "grpc", "httpupgrade", "xhttp")
+from . import i18n
+from .scan import DEFAULT_CANDIDATES
+
+PROTOCOLS = ("vless",)
+NETWORKS = ("raw", "grpc", "xhttp")
 SECURITIES = ("reality", "tls", "none")
+VLESS_MODES = ("native", "xorpub", "random")
+VLESS_TICKETS = ("600s", "0s", "300-600s")
+VLESS_CLIENT_MODES = ("0rtt", "1rtt")
+XHTTP_MODES = ("auto", "packet-up", "stream-up", "stream-one")
 FLOWS = ("", "xtls-rprx-vision")
-SS_METHODS = (
-    "2022-blake3-aes-128-gcm",
-    "2022-blake3-aes-256-gcm",
-    "2022-blake3-chacha20-poly1305",
-    "aes-256-gcm",
-    "aes-128-gcm",
-    "chacha20-poly1305",
-)
 FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "random", "randomized")
+VLESS_HANDSHAKE = "mlkem768x25519plus"
 DEFAULT_DEST = "www.cloudflare.com:443"
 DEFAULT_SNI = "www.cloudflare.com"
 DEFAULT_TAG_PREFIX = "in"
+PADDING_RE = re.compile(r"^[0-9]+-[0-9]+-[0-9]+$")
+TICKET_RE = re.compile(r"^([0-9]+s|[0-9]+-[0-9]+s)$")
 EMAIL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHORT_ID_RE = re.compile(r"^[0-9a-f]{0,16}$")
+SUB_ALPHABET = string.ascii_letters + string.digits + "-_"
+SUB_PORT = 2096
+XRAY_VERSION = "v26.10.21"
+VERSION_CHOICES = (XRAY_VERSION, "latest")
+LOG_LEVELS = ("debug", "info", "warning", "error")
+SUB_SEGMENT_LEN = 64
+API_TAG = "api"
+API_LISTEN = "127.0.0.1"
+API_PORT = 62789
+API_SERVICES = ("HandlerService", "LoggerService", "StatsService", "RoutingService")
+DNS_TAG = "dns"
+DEFAULT_ACCESS_LOG = "/var/log/xray/access.log"
+DEFAULT_SSH_BANTIME = "3d"
+DEFAULT_SSH_MAXRETRY = 3
+DEFAULT_IGNOREIP = "127.0.0.1/8 ::1"
+DEFAULT_ERROR_LOG = "/var/log/xray/error.log"
+DEFAULT_METRICS = "127.0.0.1:11111"
 
 P = 2 ** 255 - 19
 A24 = 121665
 BASE_POINT = bytes([9] + [0] * 31)
+
+RELEVANT_FIELDS = {
+    ("reality", "raw"): ("dest", "sni", "short_id", "spider_x", "fingerprint", "mldsa65"),
+    ("reality", "grpc"): ("dest", "sni", "short_id", "spider_x", "fingerprint", "mldsa65", "service"),
+    ("reality", "xhttp"): ("dest", "sni", "short_id", "spider_x", "fingerprint", "mldsa65", "path", "host_header", "mode"),
+    ("tls", "raw"): ("sni", "alpn", "fingerprint", "cert_file", "key_file"),
+    ("tls", "grpc"): ("sni", "alpn", "fingerprint", "cert_file", "key_file", "service"),
+    ("tls", "xhttp"): ("sni", "alpn", "fingerprint", "cert_file", "key_file", "path", "host_header", "mode"),
+    ("none", "raw"): (),
+    ("none", "grpc"): ("service",),
+    ("none", "xhttp"): ("path", "host_header", "mode"),
+}
 
 
 class XrayError(Exception):
@@ -83,7 +115,8 @@ def x25519(scalar: bytes, point: bytes) -> bytes:
     if swap:
         x2, x3 = x3, x2
         z2, z3 = z3, z2
-    return (x2 * pow(z2, P - 2, P) % P).to_bytes(32, "little")
+    result = (x2 * pow(z2, P - 2, P)) % P
+    return result.to_bytes(32, "little")
 
 
 def x25519_keypair() -> tuple[str, str]:
@@ -109,12 +142,12 @@ def parse_x25519_output(text: str) -> tuple[str, str]:
         elif "public" in low and not public:
             public = value
     if not private or not public:
-        raise XrayError("xray x25519 не вернул пару ключей")
+        raise XrayError("xray x25519 returned no key pair")
     try:
         if len(_unb64url(private)) != 32 or len(_unb64url(public)) != 32:
-            raise XrayError("ключи x25519 неверной длины")
+            raise XrayError("x25519 keys have the wrong length")
     except (ValueError, IndexError):
-        raise XrayError("ключи x25519 не разобраны") from None
+        raise XrayError("x25519 keys are not decodable") from None
     return private, public
 
 
@@ -129,28 +162,131 @@ def gen_short_id(length: int = 8) -> str:
 
 def gen_email(prefix: str = "user") -> str:
     clean = re.sub(r"[^A-Za-z0-9._-]", "", prefix or "user") or "user"
-    return f"{clean}-{secrets.token_hex(3)}"
+    return clean + "-" + secrets.token_hex(3)
 
 
-def gen_ss_password(method: str) -> str:
-    size = 32 if "256" in method else 16
-    raw = secrets.token_bytes(size)
-    if method.startswith("2022"):
-        return base64.b64encode(raw).decode("ascii")
-    return base64.b64encode(raw).decode("ascii").rstrip("=")
+def gen_sub_segment(length: int = SUB_SEGMENT_LEN) -> str:
+    return "".join(secrets.choice(SUB_ALPHABET) for _ in range(int(length)))
+
+
+HOST_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$")
+PATH_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,200}$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+ALPN_RE = re.compile(r"^[a-z0-9./-]{1,20}$")
+FILE_RE = re.compile(r"^/[A-Za-z0-9._/-]{1,200}$")
+
+
+def valid_host_name(value: object, label: str = "the server name") -> str:
+    text = str(value or "").strip()
+    if not text or not HOST_RE.match(text) or ".." in text:
+        raise XrayError("%s is not a valid host name" % label)
+    return text
+
+
+def valid_request_path(value: object, label: str = "the path") -> str:
+    text = str(value or "").strip() or "/"
+    if not text.startswith("/"):
+        text = "/" + text
+    if not PATH_RE.match(text) or ".." in text:
+        raise XrayError("%s is not a safe request path" % label)
+    return text
+
+
+def valid_token(value: object, label: str = "the value") -> str:
+    text = str(value or "").strip()
+    if text and not TOKEN_RE.match(text):
+        raise XrayError("%s may hold only letters, digits, dot, dash and underscore" % label)
+    return text
+
+
+def valid_alpn(value: object) -> list[str]:
+    items = [item.strip() for item in str(value or "").replace(" ", ",").split(",") if item.strip()]
+    if not items:
+        raise XrayError("the alpn list must not be empty")
+    if len(items) > 4:
+        raise XrayError("the alpn list is too long")
+    for item in items:
+        if not ALPN_RE.match(item):
+            raise XrayError("the alpn value %s is not supported" % item)
+    return items
+
+
+def valid_cert_path(value: object, label: str = "the certificate path") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    blocked = ("/proc", "/sys", "/dev")
+    if not FILE_RE.match(text) or ".." in text.split("/") or text.startswith(blocked):
+        raise XrayError("%s must be a simple absolute path" % label)
+    return text
+
+
+def valid_dest(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise XrayError("the destination must not be empty")
+    host = text
+    port = "443"
+    if text.startswith("["):
+        host, _, rest = text[1:].partition("]")
+        port = rest.lstrip(":") or "443"
+    elif text.count(":") == 1:
+        host, port = text.split(":", 1)
+    if not str(port).isdigit() or not 1 <= int(port) <= 65535:
+        raise XrayError("the destination port must be between 1 and 65535")
+    import ipaddress
+
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        host = valid_host_name(host, "the destination host")
+    return "%s:%d" % (host, int(port))
+
+
+def sanitize_remark(value: object, limit: int = 40) -> str:
+    text = "".join(char for char in str(value or "") if char.isprintable()).strip()
+    if not text:
+        raise XrayError("the name must not be empty")
+    return text[:limit]
+
+
+def valid_sub_segment(value: object) -> str:
+    text = str(value or "")
+    if len(text) != SUB_SEGMENT_LEN:
+        raise XrayError("a subscription segment must be exactly %d characters" % SUB_SEGMENT_LEN)
+    for char in text:
+        if char not in SUB_ALPHABET:
+            raise XrayError("a subscription segment must use the url safe base64 alphabet")
+    return text
 
 
 def valid_email(value: object) -> str:
     text = str(value or "").strip()
     if not EMAIL_RE.match(text):
-        raise XrayError("имя клиента: буквы, цифры, точка, дефис, подчёркивание, до 64")
+        raise XrayError("a client name must be letters, digits, dot, dash or underscore, up to 64 characters")
     return text
 
 
 def valid_short_id(value: object) -> str:
     text = str(value or "").strip().lower()
     if not SHORT_ID_RE.match(text):
-        raise XrayError("short id: до 16 hex символов")
+        raise XrayError("a short id must be up to 16 hex characters")
+    return text
+
+
+def valid_padding(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not PADDING_RE.match(text):
+        raise XrayError("padding must look like 100-111-1111")
+    return text
+
+
+def valid_ticket(value: object) -> str:
+    text = str(value or "").strip() or "600s"
+    if not TICKET_RE.match(text):
+        raise XrayError("a ticket must look like 600s or 300-600s")
     return text
 
 
@@ -166,15 +302,68 @@ def split_authority(value: str) -> tuple[str, int]:
     try:
         number = int(port or 0)
     except ValueError:
-        raise XrayError("порт должен быть числом") from None
+        raise XrayError("a port must be a number") from None
     if not 1 <= number <= 65535:
-        raise XrayError("порт должен быть 1..65535")
+        raise XrayError("a port must be between 1 and 65535")
     return host.strip(), number
 
 
 def join_authority(host: str, port: int) -> str:
     host = (host or "").strip().strip("[]")
-    return f"[{host}]:{int(port)}" if ":" in host else f"{host}:{int(port)}"
+    return "[%s]:%d" % (host, int(port)) if ":" in host else "%s:%d" % (host, int(port))
+
+
+@dataclass
+class VlessEncryption:
+    mode: str = "native"
+    ticket: str = "600s"
+    padding: str = ""
+    private_key: str = ""
+    public_key: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "ticket": self.ticket,
+            "padding": self.padding,
+            "private_key": self.private_key,
+            "public_key": self.public_key,
+        }
+
+    @staticmethod
+    def from_dict(raw: dict[str, Any] | None) -> "VlessEncryption":
+        data = raw or {}
+        return VlessEncryption(
+            mode=str(data.get("mode", "native") or "native"),
+            ticket=str(data.get("ticket", "600s") or "600s"),
+            padding=str(data.get("padding", "") or ""),
+            private_key=str(data.get("private_key", "") or ""),
+            public_key=str(data.get("public_key", "") or ""),
+        )
+
+    def generate(self) -> "VlessEncryption":
+        if self.mode not in VLESS_MODES:
+            raise XrayError("the vless encryption mode must be one of " + ", ".join(VLESS_MODES))
+        self.ticket = valid_ticket(self.ticket)
+        self.padding = valid_padding(self.padding)
+        self.private_key, self.public_key = x25519_keypair()
+        return self
+
+    def decryption(self) -> str:
+        parts = [VLESS_HANDSHAKE, self.mode, self.ticket]
+        if self.padding:
+            parts.append(self.padding)
+        parts.append(self.private_key)
+        return ".".join(item for item in parts if item)
+
+    def encryption(self, mode: str = "0rtt") -> str:
+        if mode not in VLESS_CLIENT_MODES:
+            raise XrayError("the client encryption mode must be 0rtt or 1rtt")
+        parts = [VLESS_HANDSHAKE, self.mode, mode]
+        if self.padding:
+            parts.append(self.padding)
+        parts.append(self.public_key)
+        return ".".join(item for item in parts if item)
 
 
 @dataclass
@@ -182,24 +371,38 @@ class XrayClient:
     email: str = ""
     ident: str = ""
     flow: str = ""
-    password: str = ""
+    limit_ip: int = 0
     total_gb: int = 0
     expiry_ms: int = 0
-    limit_ip: int = 0
     enable: bool = True
     comment: str = ""
+    sub_id: str = ""
+    sub_key: str = ""
+
+    def ensure_subscription(self) -> tuple[str, str]:
+        if not self.sub_id:
+            self.sub_id = gen_sub_segment()
+        if not self.sub_key:
+            self.sub_key = gen_sub_segment()
+        return self.sub_id, self.sub_key
+
+    def sub_path(self) -> str:
+        if not self.sub_id or not self.sub_key:
+            return ""
+        return "/%s/%s" % (self.sub_id, self.sub_key)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "email": self.email,
             "ident": self.ident,
             "flow": self.flow,
-            "password": self.password,
+            "limit_ip": int(self.limit_ip),
             "total_gb": int(self.total_gb),
             "expiry_ms": int(self.expiry_ms),
-            "limit_ip": int(self.limit_ip),
             "enable": bool(self.enable),
             "comment": self.comment,
+            "sub_id": self.sub_id,
+            "sub_key": self.sub_key,
         }
 
     @staticmethod
@@ -209,27 +412,19 @@ class XrayClient:
             email=str(data.get("email", "")),
             ident=str(data.get("ident", "")),
             flow=str(data.get("flow", "")),
-            password=str(data.get("password", "")),
+            limit_ip=int(data.get("limit_ip", 0) or 0),
             total_gb=int(data.get("total_gb", 0) or 0),
             expiry_ms=int(data.get("expiry_ms", 0) or 0),
-            limit_ip=int(data.get("limit_ip", 0) or 0),
             enable=bool(data.get("enable", True)),
             comment=str(data.get("comment", "")),
+            sub_id=str(data.get("sub_id", "") or ""),
+            sub_key=str(data.get("sub_key", "") or ""),
         )
 
-    def entry(self, protocol: str) -> dict[str, Any]:
-        if protocol == "vless":
-            body: dict[str, Any] = {"id": self.ident, "email": self.email}
-            if self.flow:
-                body["flow"] = self.flow
-        elif protocol == "vmess":
-            body = {"id": self.ident, "email": self.email, "security": "auto"}
-        elif protocol == "trojan":
-            body = {"password": self.password, "email": self.email}
-        elif protocol == "shadowsocks":
-            body = {"password": self.password, "email": self.email}
-        else:
-            raise XrayError(f"неизвестный протокол: {protocol}")
+    def entry(self) -> dict[str, Any]:
+        body: dict[str, Any] = {"id": self.ident, "email": self.email}
+        if self.flow:
+            body["flow"] = self.flow
         if self.limit_ip:
             body["limitIp"] = int(self.limit_ip)
         if self.total_gb:
@@ -249,24 +444,29 @@ class XrayInbound:
     protocol: str = "vless"
     port: int = 443
     listen: str = ""
-    network: str = "tcp"
+    network: str = "raw"
     security: str = "reality"
     tag: str = ""
     enable: bool = True
     clients: list[XrayClient] = field(default_factory=list)
     dest: str = DEFAULT_DEST
     sni: str = DEFAULT_SNI
-    private_key: str = ""
-    public_key: str = ""
     short_ids: list[str] = field(default_factory=list)
     spider_x: str = ""
     fingerprint: str = "chrome"
+    mldsa65_seed: str = ""
+    mldsa65_verify: str = ""
+    reality_private: str = ""
+    reality_public: str = ""
     alpn: list[str] = field(default_factory=list)
+    cert_file: str = ""
+    key_file: str = ""
     path: str = "/"
     host_header: str = ""
+    xhttp_mode: str = "auto"
     service_name: str = ""
-    ss_method: str = "2022-blake3-aes-128-gcm"
-    ss_password: str = ""
+    multi_mode: bool = False
+    encryption: VlessEncryption = field(default_factory=VlessEncryption)
 
     def client(self, email: str) -> XrayClient | None:
         for item in self.clients:
@@ -277,14 +477,11 @@ class XrayInbound:
     def make_client(self, email: str) -> XrayClient:
         name = valid_email(email)
         if self.client(name) is not None:
-            raise XrayError("клиент с таким именем уже есть")
-        client = XrayClient(email=name)
-        if self.protocol in {"vless", "vmess"}:
-            client.ident = gen_uuid()
-        if self.protocol == "vless" and self.security in {"reality", "tls"} and self.network == "tcp":
+            raise XrayError("a client with this name already exists")
+        client = XrayClient(email=name, ident=gen_uuid())
+        if self.security in {"reality", "tls"} and self.network == "raw":
             client.flow = "xtls-rprx-vision"
-        if self.protocol in {"trojan", "shadowsocks"}:
-            client.password = gen_ss_password(self.ss_method) if self.protocol == "shadowsocks" else secrets.token_urlsafe(16)
+        client.ensure_subscription()
         self.clients.append(client)
         return client
 
@@ -293,62 +490,54 @@ class XrayInbound:
         self.clients = [item for item in self.clients if item.email != email]
         return len(self.clients) != before
 
+    def post_quantum(self) -> bool:
+        return bool(self.encryption.private_key and self.encryption.public_key)
+
     def settings(self) -> dict[str, Any]:
-        entries = [client.entry(self.protocol) for client in self.clients]
-        if self.protocol == "vless":
-            return {"clients": entries, "decryption": "none", "fallbacks": []}
-        if self.protocol == "vmess":
-            return {"clients": entries}
-        if self.protocol == "trojan":
-            return {"clients": entries, "fallbacks": []}
-        if self.protocol == "shadowsocks":
-            return {
-                "method": self.ss_method,
-                "password": self.ss_password,
-                "network": "tcp,udp",
-                "clients": [{"password": item.password, "email": item.email, "enable": item.enable} for item in self.clients],
-            }
-        raise XrayError(f"неизвестный протокол: {self.protocol}")
+        if not self.post_quantum():
+            raise XrayError("vless encryption needs a generated post quantum key pair")
+        return {
+            "clients": [client.entry() for client in self.clients],
+            "decryption": self.encryption.decryption(),
+            "fallbacks": [],
+        }
 
     def stream(self) -> dict[str, Any]:
-        stream: dict[str, Any] = {"network": self.network, "security": self.security}
-        if self.network == "tcp":
+        network = "tcp" if self.network == "raw" else self.network
+        stream: dict[str, Any] = {"network": network, "security": self.security}
+        if self.network == "raw":
             stream["tcpSettings"] = {"acceptProxyProtocol": False, "header": {"type": "none"}}
-        if self.network == "ws":
-            stream["wsSettings"] = {"path": self.path or "/", "host": self.host_header, "headers": {"Host": self.host_header} if self.host_header else {}}
         if self.network == "grpc":
-            stream["grpcSettings"] = {"serviceName": self.service_name or self.tag or self.remark, "multiMode": False}
-        if self.network == "httpupgrade":
-            stream["httpupgradeSettings"] = {"path": self.path or "/", "host": self.host_header}
+            stream["grpcSettings"] = {"serviceName": self.service_name or self.tag or self.remark, "multiMode": bool(self.multi_mode)}
         if self.network == "xhttp":
-            stream["xhttpSettings"] = {"path": self.path or "/", "host": self.host_header, "mode": "auto"}
+            settings: dict[str, Any] = {"path": self.path or "/", "mode": self.xhttp_mode or "auto"}
+            if self.host_header:
+                settings["host"] = self.host_header
+            stream["xhttpSettings"] = settings
         if self.security == "reality":
             names = [item for item in {self.sni, self.host_header} if item]
-            stream["realitySettings"] = {
+            reality: dict[str, Any] = {
                 "show": False,
                 "xver": 0,
                 "dest": self.dest,
                 "serverNames": names or [DEFAULT_SNI],
-                "privateKey": self.private_key,
+                "privateKey": self.reality_private,
                 "shortIds": self.short_ids or [""],
-                "settings": {
-                    "publicKey": self.public_key,
-                    "fingerprint": self.fingerprint,
-                    "serverName": "",
-                    "spiderX": self.spider_x,
-                },
+                "spiderX": self.spider_x or "/",
             }
+            if self.mldsa65_seed:
+                reality["mldsa65Seed"] = self.mldsa65_seed
+            stream["realitySettings"] = reality
         elif self.security == "tls":
-            stream["tlsSettings"] = {
-                "serverName": self.sni,
-                "alpn": self.alpn or ["h2", "http/1.1"],
-                "settings": {"allowInsecure": False, "fingerprint": self.fingerprint},
-            }
+            tls: dict[str, Any] = {"serverName": self.sni, "alpn": self.alpn or ["h2", "http/1.1"]}
+            if self.cert_file and self.key_file:
+                tls["certificates"] = [{"certificateFile": self.cert_file, "keyFile": self.key_file}]
+            stream["tlsSettings"] = tls
         return stream
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "tag": self.tag or f"{DEFAULT_TAG_PREFIX}-{self.port}",
+            "tag": self.tag or "%s-%d" % (DEFAULT_TAG_PREFIX, self.port),
             "listen": self.listen,
             "port": int(self.port),
             "protocol": self.protocol,
@@ -371,17 +560,22 @@ class XrayInbound:
             "clients": [item.to_dict() for item in self.clients],
             "dest": self.dest,
             "sni": self.sni,
-            "private_key": self.private_key,
-            "public_key": self.public_key,
             "short_ids": list(self.short_ids),
             "spider_x": self.spider_x,
             "fingerprint": self.fingerprint,
+            "mldsa65_seed": self.mldsa65_seed,
+            "mldsa65_verify": self.mldsa65_verify,
+            "reality_private": self.reality_private,
+            "reality_public": self.reality_public,
             "alpn": list(self.alpn),
+            "cert_file": self.cert_file,
+            "key_file": self.key_file,
             "path": self.path,
             "host_header": self.host_header,
+            "xhttp_mode": self.xhttp_mode,
             "service_name": self.service_name,
-            "ss_method": self.ss_method,
-            "ss_password": self.ss_password,
+            "multi_mode": bool(self.multi_mode),
+            "encryption": self.encryption.to_dict(),
         }
 
     @staticmethod
@@ -393,243 +587,289 @@ class XrayInbound:
             protocol=str(data.get("protocol", "vless")),
             port=int(data.get("port", 443) or 443),
             listen=str(data.get("listen", "")),
-            network=str(data.get("network", "tcp")),
+            network=str(data.get("network", "raw")),
             security=str(data.get("security", "reality")),
             tag=str(data.get("tag", "")),
             enable=bool(data.get("enable", True)),
             clients=[XrayClient.from_dict(item) for item in data.get("clients") or [] if isinstance(item, dict)],
             dest=str(data.get("dest", DEFAULT_DEST)),
             sni=str(data.get("sni", DEFAULT_SNI)),
-            private_key=str(data.get("private_key", "")),
-            public_key=str(data.get("public_key", "")),
             short_ids=[str(item) for item in data.get("short_ids") or []],
             spider_x=str(data.get("spider_x", "")),
             fingerprint=str(data.get("fingerprint", "chrome")),
+            mldsa65_seed=str(data.get("mldsa65_seed", "") or ""),
+            mldsa65_verify=str(data.get("mldsa65_verify", "") or ""),
+            reality_private=str(data.get("reality_private", data.get("private_key", "")) or ""),
+            reality_public=str(data.get("reality_public", data.get("public_key", "")) or ""),
             alpn=[str(item) for item in data.get("alpn") or []],
+            cert_file=str(data.get("cert_file", "") or ""),
+            key_file=str(data.get("key_file", "") or ""),
             path=str(data.get("path", "/")),
             host_header=str(data.get("host_header", "")),
+            xhttp_mode=str(data.get("xhttp_mode", "auto") or "auto"),
             service_name=str(data.get("service_name", "")),
-            ss_method=str(data.get("ss_method", "2022-blake3-aes-128-gcm")),
-            ss_password=str(data.get("ss_password", "")),
+            multi_mode=bool(data.get("multi_mode", False)),
+            encryption=VlessEncryption.from_dict(data.get("encryption")),
         )
 
 
-REALITY_NETWORKS = ("tcp", "grpc", "xhttp")
+def relevant_fields(security: str, network: str) -> tuple[str, ...]:
+    if security not in SECURITIES:
+        raise XrayError("security must be one of " + ", ".join(SECURITIES))
+    if network not in NETWORKS:
+        raise XrayError("network must be one of " + ", ".join(NETWORKS))
+    return RELEVANT_FIELDS[(security, network)]
 
 
-def reality_allows(network: str) -> bool:
-    return network in REALITY_NETWORKS
+def field_applies(security: str, network: str, name: str) -> bool:
+    return name in relevant_fields(security, network)
+
+
+def security_needs_target(security: str) -> bool:
+    return security == "reality"
+
+
+def security_supports_mldsa65(security: str) -> bool:
+    return security == "reality"
 
 
 def new_inbound(
     protocol: str = "vless",
     port: int = 443,
-    network: str = "tcp",
+    network: str = "raw",
     security: str = "reality",
     remark: str = "",
 ) -> XrayInbound:
     if protocol not in PROTOCOLS:
-        raise XrayError("протокол: vless, vmess, trojan, shadowsocks")
+        raise XrayError("protocol must be vless")
     if network not in NETWORKS:
-        raise XrayError("сеть: " + ", ".join(NETWORKS))
+        raise XrayError("network must be one of " + ", ".join(NETWORKS))
     if security not in SECURITIES:
-        raise XrayError("безопасность: " + ", ".join(SECURITIES))
-    if protocol in {"vmess", "shadowsocks"} and security == "reality":
-        raise XrayError("reality доступен только для vless и trojan")
-    if security == "reality" and not reality_allows(network):
-        raise XrayError("reality работает только с сетями tcp, grpc и xhttp")
+        raise XrayError("security must be one of " + ", ".join(SECURITIES))
     inbound = XrayInbound(
         protocol=protocol,
         port=int(port),
         network=network,
         security=security,
-        remark=remark or f"{protocol}-{port}",
+        remark=remark or "vless-%d-%s" % (port, network),
     )
-    inbound.tag = f"in-{port}-{network}-{protocol}"
+    inbound.tag = "in-%d-%s" % (port, network)
+    inbound.encryption = VlessEncryption().generate()
     if security == "reality":
-        private, public = x25519_keypair()
-        inbound.private_key = private
-        inbound.public_key = public
+        inbound.reality_private, inbound.reality_public = x25519_keypair()
         inbound.short_ids = [gen_short_id()]
         inbound.sni = DEFAULT_SNI
         inbound.dest = DEFAULT_DEST
+        inbound.spider_x = ""
     if security == "tls":
         inbound.alpn = ["h2", "http/1.1"]
-    if protocol == "shadowsocks":
-        inbound.ss_password = gen_ss_password(inbound.ss_method)
     return inbound
 
 
-def config_json(inbounds: list[XrayInbound], log_level: str = "warning") -> dict[str, Any]:
-    active = [item for item in inbounds if item.enable]
+def policy_block(levels: tuple[int, ...] = (0,)) -> dict[str, Any]:
+    table: dict[str, Any] = {}
+    for level in levels:
+        table[str(int(level))] = {
+            "statsUserUplink": True,
+            "statsUserDownlink": True,
+            "statsUserOnline": True,
+            "connIdle": 300,
+            "uplinkOnly": 2,
+            "downlinkOnly": 5,
+        }
     return {
-        "log": {"loglevel": log_level, "access": "none", "error": ""},
-        "inbounds": [item.to_json() for item in active],
-        "outbounds": [
-            {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4v6"}},
-            {"protocol": "blackhole", "tag": "blocked", "settings": {}},
-        ],
-        "routing": {
-            "domainStrategy": "AsAscii",
-            "rules": [
-                {"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"},
-                {"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"},
-            ],
+        "levels": table,
+        "system": {
+            "statsInboundUplink": True,
+            "statsInboundDownlink": True,
+            "statsOutboundUplink": False,
+            "statsOutboundDownlink": False,
         },
     }
 
 
-def config_text(inbounds: list[XrayInbound], log_level: str = "warning") -> str:
-    return json.dumps(config_json(inbounds, log_level), ensure_ascii=False, indent=2, sort_keys=False)
+def api_block(tag: str = API_TAG) -> dict[str, Any]:
+    return {"tag": tag, "services": list(API_SERVICES)}
 
 
-def _remark_suffix(inbound: XrayInbound, email: str, network: str) -> str:
-    base = inbound.remark or f"{inbound.protocol}-{inbound.port}"
+def api_inbound(tag: str = API_TAG, port: int = API_PORT) -> dict[str, Any]:
+    return {
+        "listen": API_LISTEN,
+        "port": int(port),
+        "protocol": "tunnel",
+        "settings": {"rewriteAddress": API_LISTEN},
+        "tag": tag,
+    }
+
+
+def routing_block(tag: str = API_TAG, dns_tag: str = "") -> dict[str, Any]:
+    rules: list[dict[str, Any]] = [{"type": "field", "inboundTag": [tag], "outboundTag": tag}]
+    if dns_tag:
+        rules.append({"type": "field", "inboundTag": [dns_tag], "outboundTag": dns_tag})
+    rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"})
+    rules.append({"type": "field", "protocol": ["bittorrent"], "outboundTag": "blocked"})
+    return {"domainStrategy": "AsIs", "rules": rules}
+
+
+def outbound_block() -> list[dict[str, Any]]:
+    return [
+        {
+            "protocol": "freedom",
+            "settings": {
+                "finalRules": [
+                    {"action": "block", "ip": ["geoip:private"]},
+                    {"action": "allow"},
+                ]
+            },
+            "tag": "direct",
+        },
+        {"protocol": "blackhole", "settings": {}, "tag": "blocked"},
+    ]
+
+
+def log_block(log_level: str = "warning", access: str = DEFAULT_ACCESS_LOG, error: str = DEFAULT_ERROR_LOG, mask: str = "") -> dict[str, Any]:
+    return {
+        "loglevel": str(log_level or "warning"),
+        "access": access,
+        "error": error,
+        "dnsLog": False,
+        "maskAddress": mask,
+    }
+
+
+def dns_block(servers: list[str], dns_tag: str = "dns") -> dict[str, Any]:
+    return {"servers": list(servers), "queryStrategy": "UseIPv4v6", "disableCache": False, "tag": dns_tag}
+
+
+def config_json(
+    inbounds: list[XrayInbound],
+    log_level: str = "warning",
+    access_log: str = DEFAULT_ACCESS_LOG,
+    error_log: str = DEFAULT_ERROR_LOG,
+    api_enabled: bool = True,
+    api_port: int = API_PORT,
+    metrics: str = DEFAULT_METRICS,
+    dns_servers: list[str] | None = None,
+    levels: tuple[int, ...] = (0,),
+) -> dict[str, Any]:
+    active = [item for item in inbounds if item.enable]
+    servers = [str(item).strip() for item in (dns_servers or []) if str(item).strip()]
+    config: dict[str, Any] = {
+        "log": log_block(log_level, access_log, error_log),
+        "inbounds": [item.to_json() for item in active],
+        "outbounds": outbound_block(),
+        "routing": routing_block(API_TAG, DNS_TAG if servers else ""),
+        "policy": policy_block(levels),
+        "stats": {},
+    }
+    if api_enabled:
+        config["api"] = api_block(API_TAG)
+        config["inbounds"] = [api_inbound(API_TAG, api_port)] + config["inbounds"]
+    if metrics:
+        config["metrics"] = {"listen": metrics, "tag": "metrics_out"}
+    if servers:
+        config["dns"] = dns_block(servers, DNS_TAG)
+        config["outbounds"] = config["outbounds"] + [{"protocol": "dns", "settings": {"nonIPQuery": "drop", "rewriteAddress": API_LISTEN}, "tag": DNS_TAG}]
+    return config
+
+
+def config_text(
+    inbounds: list[XrayInbound],
+    log_level: str = "warning",
+    access_log: str = DEFAULT_ACCESS_LOG,
+    error_log: str = DEFAULT_ERROR_LOG,
+    api_enabled: bool = True,
+    api_port: int = API_PORT,
+    metrics: str = DEFAULT_METRICS,
+    dns_servers: list[str] | None = None,
+    levels: tuple[int, ...] = (0,),
+) -> str:
+    return json.dumps(
+        config_json(inbounds, log_level, access_log, error_log, api_enabled, api_port, metrics, dns_servers, levels),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=False,
+    )
+
+
+def _remark_suffix(inbound: XrayInbound, email: str) -> str:
+    base = inbound.remark or "vless-%d" % inbound.port
     parts = [base, email]
     if inbound.security != "none":
         parts.append(inbound.security)
-    if network:
-        parts.append(network)
+    parts.append(inbound.network)
     return "-".join(item for item in parts if item)
 
 
-def _reality_params(inbound: XrayInbound, params: dict[str, str]) -> None:
-    params["security"] = "reality"
-    params["sni"] = inbound.sni or DEFAULT_SNI
-    params["pbk"] = inbound.public_key
-    params["sid"] = (inbound.short_ids or [""])[0]
-    params["fp"] = inbound.fingerprint or "chrome"
-    params["spx"] = inbound.spider_x or ""
-    params["pqv"] = ""
-
-
-def _network_params(inbound: XrayInbound, params: dict[str, str]) -> None:
-    params["type"] = inbound.network
-    if inbound.network == "ws":
-        params["path"] = inbound.path or "/"
-        if inbound.host_header:
-            params["host"] = inbound.host_header
-    elif inbound.network in {"httpupgrade", "xhttp"}:
-        params["path"] = inbound.path or "/"
-        if inbound.host_header:
-            params["host"] = inbound.host_header
-    elif inbound.network == "grpc":
-        params["serviceName"] = inbound.service_name or inbound.tag
-        params["mode"] = "gun"
-    elif inbound.network == "tcp":
+def _stream_params(inbound: XrayInbound, params: dict[str, str]) -> None:
+    params["type"] = "tcp" if inbound.network == "raw" else inbound.network
+    if inbound.network == "raw":
         params["headerType"] = "none"
-
-
-def _query(params: dict[str, str]) -> str:
-    pairs = [f"{key}={value}" for key, value in params.items() if value != ""]
-    return "&".join(pairs)
-
-
-def vless_link(inbound: XrayInbound, client: XrayClient, address: str, port: int | None = None) -> str:
-    params: dict[str, str] = {}
-    _network_params(inbound, params)
-    if inbound.security == "reality":
-        _reality_params(inbound, params)
-    elif inbound.security == "tls":
-        params["security"] = "tls"
-        params["sni"] = inbound.sni
-        params["fp"] = inbound.fingerprint or "chrome"
-        if inbound.alpn:
-            params["alpn"] = ",".join(inbound.alpn)
-    else:
-        params["security"] = "none"
-    params["encryption"] = "none"
-    if client.flow and inbound.network == "tcp" and inbound.security in {"reality", "tls"}:
-        params["flow"] = client.flow
-    host = join_authority(address, port or inbound.port)
-    remark = _remark_suffix(inbound, client.email, inbound.network)
-    return f"vless://{client.ident}@{host}?{_query(params)}#{_remark_url(remark)}"
-
-
-def trojan_link(inbound: XrayInbound, client: XrayClient, address: str, port: int | None = None) -> str:
-    params: dict[str, str] = {}
-    _network_params(inbound, params)
-    if inbound.security == "reality":
-        _reality_params(inbound, params)
-    elif inbound.security == "tls":
-        params["security"] = "tls"
-        params["sni"] = inbound.sni
-        params["fp"] = inbound.fingerprint or "chrome"
-        if inbound.alpn:
-            params["alpn"] = ",".join(inbound.alpn)
-    else:
-        params["security"] = "none"
-    if client.flow and inbound.network == "tcp" and inbound.security == "reality":
-        params["flow"] = client.flow
-    host = join_authority(address, port or inbound.port)
-    remark = _remark_suffix(inbound, client.email, inbound.network)
-    password = _quote_userinfo(client.password)
-    return f"trojan://{password}@{host}?{_query(params)}#{_remark_url(remark)}"
-
-
-def vmess_link(inbound: XrayInbound, client: XrayClient, address: str, port: int | None = None) -> str:
-    body: dict[str, Any] = {
-        "v": "2",
-        "ps": _remark_suffix(inbound, client.email, inbound.network),
-        "add": address,
-        "port": str(port or inbound.port),
-        "id": client.ident,
-        "aid": "0",
-        "scy": "auto",
-        "net": inbound.network,
-        "type": "none",
-        "host": inbound.host_header,
-        "path": inbound.path if inbound.network in {"ws", "httpupgrade", "xhttp"} else "",
-        "tls": "tls" if inbound.security == "tls" else "",
-        "sni": inbound.sni if inbound.security == "tls" else "",
-        "alpn": ",".join(inbound.alpn) if inbound.security == "tls" else "",
-        "fp": inbound.fingerprint if inbound.security in {"tls", "reality"} else "",
-    }
     if inbound.network == "grpc":
-        body["path"] = inbound.service_name or inbound.tag
-    raw = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-    return "vmess://" + base64.b64encode(raw.encode("utf-8")).decode("ascii")
+        params["serviceName"] = inbound.service_name or inbound.tag
+        params["mode"] = "multi" if inbound.multi_mode else "gun"
+    if inbound.network == "xhttp":
+        params["path"] = inbound.path or "/"
+        params["mode"] = inbound.xhttp_mode or "auto"
+        if inbound.host_header:
+            params["host"] = inbound.host_header
 
 
-def ss_link(inbound: XrayInbound, client: XrayClient, address: str, port: int | None = None) -> str:
-    params: dict[str, str] = {}
-    if inbound.network != "tcp":
-        _network_params(inbound, params)
+def _security_params(inbound: XrayInbound, params: dict[str, str]) -> None:
+    if inbound.security == "reality":
+        params["security"] = "reality"
+        params["sni"] = inbound.sni or DEFAULT_SNI
+        params["fp"] = inbound.fingerprint or "chrome"
+        params["pbk"] = inbound.reality_public
+        params["sid"] = (inbound.short_ids or [""])[0]
+        if inbound.spider_x:
+            params["spx"] = inbound.spider_x
+        if inbound.mldsa65_verify:
+            params["pqv"] = inbound.mldsa65_verify
+        return
     if inbound.security == "tls":
         params["security"] = "tls"
         params["sni"] = inbound.sni
         params["fp"] = inbound.fingerprint or "chrome"
-    method = inbound.ss_method
-    if method.startswith("2022"):
-        userinfo = ":".join(_quote_userinfo(item) for item in (method, inbound.ss_password, client.password))
-    else:
-        userinfo = base64.urlsafe_b64encode(f"{method}:{client.password}".encode()).decode().rstrip("=")
+        if inbound.alpn:
+            params["alpn"] = ",".join(inbound.alpn)
+        return
+    params["security"] = "none"
+
+
+def _query(params: dict[str, str]) -> str:
+    from urllib.parse import quote
+
+    pairs = []
+    for key, value in params.items():
+        if value is None or value == "":
+            continue
+        pairs.append("%s=%s" % (quote(str(key), safe=""), quote(str(value), safe="")))
+    return "&".join(pairs)
+
+
+def vless_link(inbound: XrayInbound, client: XrayClient, address: str, port: int | None = None) -> str:
+    if not inbound.post_quantum():
+        raise XrayError("the inbound has no post quantum vless key pair")
+    params: dict[str, str] = {}
+    _stream_params(inbound, params)
+    _security_params(inbound, params)
+    params["encryption"] = inbound.encryption.encryption("0rtt")
+    if client.flow and inbound.network == "raw" and inbound.security in {"reality", "tls"}:
+        params["flow"] = client.flow
     host = join_authority(address, port or inbound.port)
-    remark = _remark_suffix(inbound, client.email, inbound.network)
-    query = f"?{_query(params)}" if _query(params) else ""
-    return f"ss://{userinfo}@{host}{query}#{_remark_url(remark)}"
+    remark = _remark_suffix(inbound, client.email)
+    return "vless://%s@%s?%s#%s" % (client.ident, host, _query(params), _remark_url(remark))
 
 
 def link_for(inbound: XrayInbound, client: XrayClient, address: str, port: int | None = None) -> str:
-    if inbound.protocol == "vless":
-        return vless_link(inbound, client, address, port)
-    if inbound.protocol == "trojan":
-        return trojan_link(inbound, client, address, port)
-    if inbound.protocol == "vmess":
-        return vmess_link(inbound, client, address, port)
-    if inbound.protocol == "shadowsocks":
-        return ss_link(inbound, client, address, port)
-    raise XrayError(f"нет ссылки для протокола {inbound.protocol}")
+    if inbound.protocol != "vless":
+        raise XrayError("only vless links are supported")
+    return vless_link(inbound, client, address, port)
 
 
 def links_for(inbound: XrayInbound, address: str, port: int | None = None) -> list[tuple[str, str]]:
     return [(item.email, link_for(inbound, item, address, port)) for item in inbound.clients]
-
-
-def _quote_userinfo(value: str) -> str:
-    from urllib.parse import quote
-
-    return quote(value or "", safe="")
 
 
 def _remark_url(value: str) -> str:
@@ -640,63 +880,90 @@ def _remark_url(value: str) -> str:
 
 def parse_link(raw: str) -> dict[str, Any]:
     text = (raw or "").strip()
-    if text.startswith("vmess://"):
-        try:
-            body = json.loads(base64.b64decode(text[len("vmess://"):] + "===").decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise XrayError("vmess ссылка не разобрана") from None
-        if not isinstance(body, dict):
-            raise XrayError("vmess ссылка не объект")
-        return {"protocol": "vmess", **body}
-    for scheme in ("vless", "trojan", "ss"):
-        if text.startswith(scheme + "://"):
-            from urllib.parse import parse_qs, unquote, urlparse
+    if not text.startswith("vless://"):
+        raise XrayError("a link must start with vless://")
+    from urllib.parse import parse_qs, unquote, urlparse
 
-            parsed = urlparse(text)
-            params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
-            return {
-                "protocol": scheme,
-                "host": parsed.hostname or "",
-                "port": parsed.port or 0,
-                "user": unquote(parsed.username or ""),
-                "remark": unquote(parsed.fragment or ""),
-                "params": params,
-            }
-    raise XrayError("ссылка должна начинаться с vless://, vmess://, trojan:// или ss://")
+    parsed = urlparse(text)
+    params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+    encryption = params.get("encryption", "")
+    if not encryption:
+        raise XrayError("the link has no vless encryption")
+    if not encryption.startswith(VLESS_HANDSHAKE + "."):
+        raise XrayError("the link uses encryption that is not post quantum: " + encryption)
+    return {
+        "protocol": "vless",
+        "host": parsed.hostname or "",
+        "port": parsed.port or 0,
+        "user": unquote(parsed.username or ""),
+        "remark": unquote(parsed.fragment or ""),
+        "params": params,
+        "encryption": encryption,
+        "post_quantum": True,
+        "reality_pq": bool(params.get("pqv")),
+    }
 
 
-def summary(inbound: XrayInbound) -> list[tuple[str, str]]:
+def subscription_payload(links: list[str]) -> str:
+    body = "\n".join(item for item in links if item)
+    return base64.b64encode(body.encode("utf-8")).decode("ascii")
+
+
+def summary(inbound: XrayInbound, language: str = i18n.DEFAULT_LANGUAGE) -> list[tuple[str, str]]:
+    lang = i18n.normalize(language)
     rows = [
-        ("протокол", inbound.protocol),
-        ("порт", str(inbound.port)),
-        ("сеть", inbound.network),
-        ("безопасность", inbound.security),
-        ("клиентов", str(len(inbound.clients))),
+        (i18n.t("SUM_PROTOCOL", lang), inbound.protocol),
+        (i18n.t("SUM_PORT", lang), str(inbound.port)),
+        (i18n.t("SUM_NETWORK", lang), inbound.network),
+        (i18n.t("SUM_SECURITY", lang), inbound.security),
+        (i18n.t("SUM_CLIENTS", lang), str(len(inbound.clients))),
+        (i18n.t("SUM_ENCRYPTION", lang), VLESS_HANDSHAKE + "." + inbound.encryption.mode),
     ]
-    if inbound.security == "reality":
-        rows.append(("dest", inbound.dest))
-        rows.append(("sni", inbound.sni))
-        rows.append(("short id", (inbound.short_ids or [""])[0]))
-    if inbound.network in {"ws", "httpupgrade", "xhttp"}:
-        rows.append(("path", inbound.path))
-    if inbound.network == "grpc":
-        rows.append(("service", inbound.service_name or inbound.tag))
+    fields = relevant_fields(inbound.security, inbound.network)
+    if "dest" in fields:
+        rows.append((i18n.t("FIELD_DEST", lang), inbound.dest))
+    if "sni" in fields:
+        rows.append((i18n.t("FIELD_SNI", lang), inbound.sni))
+    if "short_id" in fields:
+        rows.append((i18n.t("FIELD_SHORT_ID", lang), (inbound.short_ids or [""])[0]))
+    if "mldsa65" in fields:
+        rows.append((i18n.t("SUM_MLDSA", lang), i18n.t("UI_ON" if inbound.mldsa65_seed else "UI_OFF", lang)))
+    if "path" in fields:
+        rows.append((i18n.t("FIELD_PATH", lang), inbound.path))
+    if "service" in fields:
+        rows.append((i18n.t("FIELD_SERVICE", lang), inbound.service_name or inbound.tag))
+    if "cert_file" in fields:
+        rows.append((i18n.t("FIELD_CERT_FILE", lang), inbound.cert_file or i18n.t("UI_NOT_SET", lang)))
     return rows
 
 
-XRAY_VERSION = "v26.10.21"
-SCAN_DEFAULTS = (
-    "www.cloudflare.com:443",
-    "www.microsoft.com:443",
-    "www.amazon.com:443",
-    "aws.amazon.com:443",
-    "www.samsung.com:443",
-    "www.nvidia.com:443",
-    "www.amd.com:443",
-    "www.intel.com:443",
-    "www.sony.com:443",
-    "dl.google.com:443",
-)
+@dataclass
+class Subscription:
+    email: str
+    inbound_id: int
+    sub_id: str
+    sub_key: str
+    link: str
+    links: list[str] = field(default_factory=list)
+
+    def path(self) -> str:
+        return "/%s/%s" % (self.sub_id, self.sub_key)
+
+    def url(self, address: str, port: int) -> str:
+        host = (address or "").strip()
+        if host and not host.startswith("http"):
+            host = "http://" + join_authority(host, port)
+        return host.rstrip("/") + self.path()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "email": self.email,
+            "inbound_id": int(self.inbound_id),
+            "sub_id": self.sub_id,
+            "sub_key": self.sub_key,
+            "link": self.link,
+            "links": list(self.links),
+        }
 
 
 @dataclass
@@ -704,9 +971,28 @@ class XrayState:
     inbounds: list[XrayInbound] = field(default_factory=list)
     version: str = XRAY_VERSION
     log_level: str = "warning"
-    scan_targets: list[str] = field(default_factory=lambda: list(SCAN_DEFAULTS))
+    scan_targets: list[str] = field(default_factory=list)
     scan_results: list[dict[str, Any]] = field(default_factory=list)
     last_core: dict[str, Any] = field(default_factory=dict)
+    sub_port: int = SUB_PORT
+    sub_enabled: bool = False
+    sub_address: str = ""
+    fail2ban_enabled: bool = False
+    fail2ban_bantime: int = 30
+    fail2ban_ssh_bantime: str = DEFAULT_SSH_BANTIME
+    fail2ban_ssh_maxretry: int = DEFAULT_SSH_MAXRETRY
+    fail2ban_ignoreip: str = DEFAULT_IGNOREIP
+    fail2ban_jail: str = "3x-ipl"
+    scan_candidates: list[str] = field(default_factory=list)
+    scan_sni: str = ""
+    scan_xver: int = 0
+    access_log: str = DEFAULT_ACCESS_LOG
+    error_log: str = DEFAULT_ERROR_LOG
+    sub_refresh: int = 12
+    api_enabled: bool = True
+    api_port: int = API_PORT
+    metrics: str = DEFAULT_METRICS
+    dns_servers: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -716,18 +1002,57 @@ class XrayState:
             "scan_targets": list(self.scan_targets),
             "scan_results": list(self.scan_results),
             "last_core": dict(self.last_core),
+            "sub_port": int(self.sub_port),
+            "sub_enabled": bool(self.sub_enabled),
+            "sub_address": self.sub_address,
+            "fail2ban_enabled": bool(self.fail2ban_enabled),
+            "fail2ban_bantime": int(self.fail2ban_bantime),
+            "fail2ban_ssh_bantime": self.fail2ban_ssh_bantime,
+            "fail2ban_ssh_maxretry": int(self.fail2ban_ssh_maxretry),
+            "fail2ban_ignoreip": self.fail2ban_ignoreip,
+            "fail2ban_jail": self.fail2ban_jail,
+            "scan_candidates": list(self.scan_candidates),
+            "scan_sni": self.scan_sni,
+            "scan_xver": int(self.scan_xver),
+            "access_log": self.access_log,
+            "error_log": self.error_log,
+            "sub_refresh": int(self.sub_refresh),
+            "api_enabled": bool(self.api_enabled),
+            "api_port": int(self.api_port),
+            "metrics": self.metrics,
+            "dns_servers": list(self.dns_servers),
         }
 
     @staticmethod
     def from_dict(raw: dict[str, Any] | None) -> "XrayState":
         data = raw or {}
+        targets = [str(item) for item in data.get("scan_targets") or []]
         return XrayState(
             inbounds=[XrayInbound.from_dict(item) for item in data.get("inbounds") or [] if isinstance(item, dict)],
             version=str(data.get("version", XRAY_VERSION) or XRAY_VERSION),
             log_level=str(data.get("log_level", "warning") or "warning"),
-            scan_targets=[str(item) for item in data.get("scan_targets") or SCAN_DEFAULTS],
+            scan_targets=targets,
             scan_results=[item for item in data.get("scan_results") or [] if isinstance(item, dict)],
             last_core=dict(data.get("last_core") or {}),
+            sub_port=int(data.get("sub_port", SUB_PORT) or SUB_PORT),
+            sub_enabled=bool(data.get("sub_enabled", False)),
+            sub_address=str(data.get("sub_address", "") or ""),
+            fail2ban_enabled=bool(data.get("fail2ban_enabled", False)),
+            fail2ban_bantime=int(data.get("fail2ban_bantime", 30) or 30),
+            fail2ban_ssh_bantime=str(data.get("fail2ban_ssh_bantime", DEFAULT_SSH_BANTIME) or DEFAULT_SSH_BANTIME),
+            fail2ban_ssh_maxretry=int(data.get("fail2ban_ssh_maxretry", DEFAULT_SSH_MAXRETRY) or DEFAULT_SSH_MAXRETRY),
+            fail2ban_ignoreip=str(data.get("fail2ban_ignoreip", DEFAULT_IGNOREIP) or DEFAULT_IGNOREIP),
+            fail2ban_jail=str(data.get("fail2ban_jail", "3x-ipl") or "3x-ipl"),
+            scan_candidates=[str(item) for item in data.get("scan_candidates") or []],
+            scan_sni=str(data.get("scan_sni", "") or ""),
+            scan_xver=int(data.get("scan_xver", 0) or 0),
+            access_log=str(data.get("access_log", DEFAULT_ACCESS_LOG) or DEFAULT_ACCESS_LOG),
+            error_log=str(data.get("error_log", DEFAULT_ERROR_LOG) or DEFAULT_ERROR_LOG),
+            sub_refresh=int(data.get("sub_refresh", 12) or 12),
+            api_enabled=bool(data.get("api_enabled", True)),
+            api_port=int(data.get("api_port", API_PORT) or API_PORT),
+            metrics=str(data.get("metrics", DEFAULT_METRICS) or ""),
+            dns_servers=[str(item) for item in data.get("dns_servers") or []],
         )
 
     def inbound(self, ident: object) -> XrayInbound | None:
@@ -756,7 +1081,7 @@ class XrayState:
     def add(self, inbound: XrayInbound) -> XrayInbound:
         for item in self.inbounds:
             if item.port == inbound.port:
-                raise XrayError(f"порт {inbound.port} уже занят инбаундом {item.remark}")
+                raise XrayError("port %d is already used by inbound %s" % (inbound.port, item.remark))
         inbound.id = self.next_id()
         self.inbounds.append(inbound)
         return inbound
@@ -774,29 +1099,160 @@ class XrayState:
     def enabled(self) -> list[XrayInbound]:
         return [item for item in self.inbounds if item.enable]
 
-    def public_key_of(self, ident: object) -> str:
-        item = self.inbound(ident)
-        return item.public_key if item else ""
-
-    def set_reality_keys(self, ident: object, private: str, public: str) -> None:
-        item = self.inbound(ident)
-        if item is None:
-            raise XrayError("инбаунд не найден")
-        item.private_key = private
-        item.public_key = public
-
     def adopt_scan(self, ident: object, host: str, sni: str, port: int) -> XrayInbound:
         item = self.inbound(ident)
         if item is None:
-            raise XrayError("инбаунд не найден")
+            raise XrayError("inbound not found")
         host = host.strip()
         sni = sni.strip()
         if not host:
-            raise XrayError("адрес цели не задан")
-        item.dest = f"{host}:{int(port or 443)}"
+            raise XrayError("a target address is required")
+        item.dest = join_authority(host, int(port or 443))
         if sni:
             item.sni = sni
         return item
 
+    def set_reality_keys(self, ident: object, private: str, public: str) -> None:
+        item = self.inbound(ident)
+        if item is None:
+            raise XrayError("inbound not found")
+        if item.security != "reality":
+            raise XrayError("reality keys need the reality security")
+        item.reality_private = private
+        item.reality_public = public
+
+    def set_mldsa65(self, ident: object, seed: str, verify: str) -> None:
+        item = self.inbound(ident)
+        if item is None:
+            raise XrayError("inbound not found")
+        if item.security != "reality":
+            raise XrayError("ml-dsa-65 needs the reality security")
+        if not seed or not verify:
+            raise XrayError("an ml-dsa-65 key pair needs both a seed and a verify key")
+        item.mldsa65_seed = seed
+        item.mldsa65_verify = verify
+
+    def clear_mldsa65(self, ident: object) -> None:
+        item = self.inbound(ident)
+        if item is None:
+            raise XrayError("inbound not found")
+        item.mldsa65_seed = ""
+        item.mldsa65_verify = ""
+
+    def candidates(self) -> list[str]:
+        return list(self.scan_candidates) or list(DEFAULT_CANDIDATES)
+
+    def candidates_csv(self) -> str:
+        return ",".join(self.candidates())
+
+    def dns_csv(self) -> str:
+        return ", ".join(self.dns_servers)
+
+    def protocol_label(self) -> str:
+        return PROTOCOLS[0]
+
+    def encryption_label(self) -> str:
+        return VLESS_HANDSHAKE
+
+    def pinned(self) -> str:
+        value = str(self.version or "")
+        return value if value in VERSION_CHOICES and value != "latest" else XRAY_VERSION
+
+    def sub_path_pattern(self) -> str:
+        return "/<%d>/<%d>" % (SUB_SEGMENT_LEN, SUB_SEGMENT_LEN)
+
+    def address(self, fallback: str = "") -> str:
+        return (self.sub_address or fallback or "").strip()
+
+    def canonical_subscription(self, email: str, skip: Any = None) -> tuple[str, str] | None:
+        for inbound in self.inbounds:
+            for client in inbound.clients:
+                if client is skip:
+                    continue
+                if client.email == email and client.sub_id and client.sub_key:
+                    return client.sub_id, client.sub_key
+        return None
+
+    def subscriptions(self, address: str = "") -> list[Subscription]:
+        host = self.address(address)
+        order: list[str] = []
+        links: dict[str, list[str]] = {}
+        canon: dict[str, tuple[int, str, str]] = {}
+        for inbound in self.inbounds:
+            for client in inbound.clients:
+                if not client.sub_id or not client.sub_key:
+                    continue
+                if client.email not in links:
+                    order.append(client.email)
+                    links[client.email] = []
+                    canon[client.email] = (inbound.id, client.sub_id, client.sub_key)
+                try:
+                    link = link_for(inbound, client, host or "127.0.0.1", inbound.port)
+                except XrayError:
+                    link = ""
+                if link:
+                    links[client.email].append(link)
+        out: list[Subscription] = []
+        for email in order:
+            inbound_id, sub_id, sub_key = canon[email]
+            items = links[email]
+            out.append(
+                Subscription(
+                    email=email,
+                    inbound_id=inbound_id,
+                    sub_id=sub_id,
+                    sub_key=sub_key,
+                    link=items[0] if items else "",
+                    links=items,
+                )
+            )
+        return out
+
+    def subscription_of(self, email: str) -> Subscription | None:
+        for item in self.subscriptions():
+            if item.email == email:
+                return item
+        return None
+
+    def rotate_subscription(self, email: str) -> Subscription | None:
+        sub_id = gen_sub_segment()
+        sub_key = gen_sub_segment()
+        found = False
+        for inbound in self.inbounds:
+            for client in inbound.clients:
+                if client.email == email:
+                    client.sub_id = sub_id
+                    client.sub_key = sub_key
+                    found = True
+        if not found:
+            return None
+        return self.subscription_of(email)
+
+    def sub_registry(self, address: str = "") -> dict[str, Any]:
+        entries: dict[str, Any] = {}
+        for item in self.subscriptions(address):
+            entries[item.sub_id] = {
+                "key": item.sub_key,
+                "email": item.email,
+                "inbound": int(item.inbound_id),
+                "title": "OBHOD " + item.email,
+                "refresh": int(self.sub_refresh),
+                "filename": "obhod-" + item.email,
+                "enabled": True,
+                "path": item.path(),
+                "links": list(item.links),
+            }
+        return {"port": int(self.sub_port), "sub_id_len": SUB_SEGMENT_LEN, "entries": entries}
+
     def to_config(self) -> str:
-        return config_text(self.inbounds, self.log_level)
+        return config_text(
+            self.inbounds,
+            self.log_level,
+            self.access_log,
+            self.error_log,
+            self.api_enabled,
+            self.api_port,
+            self.metrics,
+            self.dns_servers,
+            tuple(sorted({0})),
+        )
