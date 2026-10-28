@@ -162,6 +162,9 @@ def test_scan_screen_with_results() -> None:
 def test_scan_screen_without_results() -> None:
     html = xscreens.scan_screen(view()).to_html()
     assert i18n.t("XR_SCAN_EMPTY") in html
+    assert "<code>none</code>" in html
+    assert "<code>0</code>" in html
+    assert "&lt;code&gt;" not in html
 
 
 def test_scan_targets_and_input_screens() -> None:

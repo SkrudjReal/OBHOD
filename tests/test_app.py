@@ -33,7 +33,31 @@ def test_foreign_user_is_denied(tmp_path: Path) -> None:
         return await bot.guard_admin(FakeEvent(from_id=99))
 
     assert asyncio.run(scenario()) is False
-    assert bot.sent
+    assert not bot.sent
+
+
+@pytest.mark.parametrize("event", [
+    {"from_id": 1},
+    {"from_id": 7, "raw": {"out": True}},
+    {"from_id": 0},
+])
+def test_outgoing_or_unknown_sender_is_ignored(tmp_path: Path, event: dict) -> None:
+    bot = make_bot(tmp_path)
+    asyncio.run(bot.on_message(FakeEvent(text="/start", **event)))
+    assert not bot.sent
+
+
+def test_start_is_registered_once(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    app = asyncio.run(bot.boot())
+    evt = FakeEvent(text="/start", chat_id=7)
+
+    async def dispatch() -> None:
+        for hook in app.hook:
+            await hook(evt)
+
+    asyncio.run(dispatch())
+    assert len(bot.sent) == 1
 
 
 def test_navigation_renders_every_page(tmp_path: Path) -> None:
@@ -355,12 +379,11 @@ def test_language_reaches_views_and_panel(tmp_path: Path) -> None:
     assert i18n.t("NAV_CORE", "zh") in xscreens.core_screen(bot.xray.view()).to_html()
 
 
-def test_denied_screen_uses_the_chosen_language(tmp_path: Path) -> None:
+def test_foreign_user_is_silently_blocked_in_every_language(tmp_path: Path) -> None:
     bot = make_bot(tmp_path)
     bot.state.language = "zh"
     run(bot.guard_admin(FakeEvent(from_id=99)))
-    html = bot.sent[-1].to_html()
-    assert i18n.t("DENIED_BODY", "zh") in html
+    assert not bot.sent
 
 
 def test_toast_and_notice_are_localized(tmp_path: Path) -> None:

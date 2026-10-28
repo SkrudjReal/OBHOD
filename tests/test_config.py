@@ -32,6 +32,7 @@ def test_load_minimal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert cfg.api_hash == HASH
     assert cfg.admin_id == 777
     assert cfg.state_dir == tmp_path / "state"
+    assert cfg.session_name == str(tmp_path / "state" / "obhod")
     assert cfg.log_level == "DEBUG"
     assert cfg.env_path == path
 
