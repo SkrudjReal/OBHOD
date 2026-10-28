@@ -33,7 +33,16 @@ def test_foreign_user_is_denied(tmp_path: Path) -> None:
         return await bot.guard_admin(FakeEvent(from_id=99))
 
     assert asyncio.run(scenario()) is False
-    assert not bot.sent
+    assert len(bot.sent) == 1
+    assert i18n.t("DENIED_BODY") in bot.sent[0].to_html()
+
+
+def test_denial_does_not_reply_to_its_own_update(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    asyncio.run(bot.on_message(FakeEvent(text="hello", from_id=99, chat_id=99)))
+    asyncio.run(bot.on_message(FakeEvent(text="Access denied", from_id=1, chat_id=99, raw={"out": True})))
+    assert len(bot.sent) == 1
+    assert i18n.t("DENIED_BODY") in bot.sent[0].to_html()
 
 
 @pytest.mark.parametrize("event", [
@@ -379,11 +388,11 @@ def test_language_reaches_views_and_panel(tmp_path: Path) -> None:
     assert i18n.t("NAV_CORE", "zh") in xscreens.core_screen(bot.xray.view()).to_html()
 
 
-def test_foreign_user_is_silently_blocked_in_every_language(tmp_path: Path) -> None:
+def test_denied_screen_uses_the_chosen_language(tmp_path: Path) -> None:
     bot = make_bot(tmp_path)
     bot.state.language = "zh"
     run(bot.guard_admin(FakeEvent(from_id=99)))
-    assert not bot.sent
+    assert i18n.t("DENIED_BODY", "zh") in bot.sent[-1].to_html()
 
 
 def test_toast_and_notice_are_localized(tmp_path: Path) -> None:

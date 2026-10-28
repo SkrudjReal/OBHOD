@@ -194,11 +194,11 @@ class Bot:
                 self.save()
                 log.info("admin claimed: %s", who)
                 return True
-            return False
-        if who == self.admin_id:
+        elif who == self.admin_id:
             return True
         chat_id = int(getattr(evt, "chat_id", 0) or 0)
         log.warning("blocked non-admin: who=%s, chat_id=%s", who, chat_id)
+        await self.send(chat_id, screens.denied(self.language))
         return False
 
     def input_values(self) -> dict[str, str]:
