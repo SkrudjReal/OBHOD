@@ -141,7 +141,6 @@ class Bot:
         )
         app.on_msg(fn=self.on_message)
         app.on_cb(fn=self.on_callback)
-        app.on_cmd("start", "menu", "help", "id", "language")(self.on_command)
         app.on_inline(fn=self.on_inline)
         app.on_update(fn=self.on_chosen)
         self.app = app
@@ -183,18 +182,22 @@ class Bot:
 
     async def guard_admin(self, evt: object) -> bool:
         who = int(getattr(evt, "from_id", 0) or 0)
+        bot_id = str(self.cfg.bot_token or "").partition(":")[0]
+        raw = getattr(evt, "raw", None)
+        if (not who or (bot_id.isdigit() and who == int(bot_id))
+                or getattr(evt, "outgoing", False) or getattr(evt, "is_outgoing", False)
+                or (isinstance(raw, dict) and raw.get("out"))):
+            return False
         if self.admin_id == 0:
             if who > 0 and self.claim_open() and self.private_chat(evt) and self.allowed(who, "claim", CLAIM_LIMIT, 60.0):
                 self.state.admin_id = who
                 self.save()
                 log.info("admin claimed: %s", who)
                 return True
-            chat_id = int(getattr(evt, "chat_id", 0) or 0)
-            await self.send(chat_id, screens.denied(self.language))
-            return False
-        if who == self.admin_id:
+        elif who == self.admin_id:
             return True
         chat_id = int(getattr(evt, "chat_id", 0) or 0)
+        log.warning("blocked non-admin: who=%s, chat_id=%s", who, chat_id)
         await self.send(chat_id, screens.denied(self.language))
         return False
 

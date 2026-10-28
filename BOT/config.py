@@ -111,7 +111,7 @@ class Config:
             api_hash=api_hash,
             admin_id=_int("ADMIN_ID", admin_raw) if admin_raw else 0,
             state_dir=state_dir,
-            session_name=values.get("OBHOD_SESSION", "obhod"),
+            session_name=str(state_dir / values.get("OBHOD_SESSION", "obhod")),
             connect_timeout=_float("OBHOD_CONNECT_TIMEOUT", values.get("OBHOD_CONNECT_TIMEOUT", 12.0), 1.0, 120.0),
             command_timeout=_float("OBHOD_COMMAND_TIMEOUT", values.get("OBHOD_COMMAND_TIMEOUT", 300.0), 5.0, 3600.0),
             apply_timeout=_float("OBHOD_APPLY_TIMEOUT", values.get("OBHOD_APPLY_TIMEOUT", 900.0), 5.0, 3600.0),

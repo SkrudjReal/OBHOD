@@ -417,7 +417,7 @@ def scan_screen(view: XrayView, results: list[ScanResult] | None = None) -> Any:
     blocks = banner(view, t)
     rows = results if results is not None else [ScanResult.from_dict(item) for item in state.scan_results]
     blocks.append(f"<p>{t('XR_SCAN_TARGETS', count=code(len(state.scan_targets)))}</p>")
-    blocks.append(f"<p>{muted(t('XR_SCAN_PROBE', sni=code(state.scan_sni or t('UI_NONE')), xver=code(state.scan_xver)))}</p>")
+    blocks.append(f"<p>{t('XR_SCAN_PROBE', sni=code(state.scan_sni or t('UI_NONE')), xver=code(state.scan_xver))}</p>")
     blocks.append(pre("\n".join(state.scan_targets[:12]) or t("UI_NONE")))
     if rows:
         pairs = []
