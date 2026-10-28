@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from html import escape
 from typing import Iterable
@@ -11,11 +12,12 @@ from . import i18n
 MAX_BUTTONS = 18
 COPY_TEXT_LIMIT = 256
 MAX_CALLBACK = 64
+CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 SEP = " · "
 
 
 def esc(value: object) -> str:
-    return escape(str(value), quote=True)
+    return escape(CONTROL.sub("", str(value)), quote=True)
 
 
 def code(value: object) -> str:

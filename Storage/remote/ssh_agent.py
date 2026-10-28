@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -87,6 +88,32 @@ def authorized_key_owner():
         if os.path.isdir(os.path.join("/home", name, ".ssh")):
             return name, os.path.join("/home", name, ".ssh", "authorized_keys")
     return "root", "/root/.ssh/authorized_keys"
+
+
+KEY_TYPES = ("ssh-", "ecdsa-", "sk-")
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+KEY_BODY = re.compile(r"[A-Za-z0-9+/=]{1,4096}")
+KEY_COMMENT = re.compile(r"[\x20-\x7e]{0,128}")
+
+
+def clean_public_key(text):
+    body = str(text or "")
+    if CONTROL.search(body):
+        raise ScriptError("bad_arg", "a public key cannot carry control characters", "key")
+    if "\n" in body or "\r" in body:
+        raise ScriptError("bad_arg", "a public key must be one line", "key")
+    body = body.strip()
+    if not body.startswith(KEY_TYPES):
+        raise ScriptError("bad_arg", "the value is not a public key", "key")
+    parts = body.split()
+    if len(parts) < 2:
+        raise ScriptError("bad_arg", "the value is not a public key", "key")
+    if not KEY_BODY.match(parts[1]):
+        raise ScriptError("bad_arg", "the key body is not base64", "key")
+    comment = " ".join(parts[2:])
+    if comment and not KEY_COMMENT.match(comment):
+        raise ScriptError("bad_arg", "the key comment has unexpected characters", "key")
+    return parts[0] + " " + parts[1] + ((" " + comment) if comment else "")
 
 
 def key_identity(line):
@@ -259,14 +286,15 @@ def add_key(flags):
         body = base64.b64decode(raw).decode("utf-8", "replace").strip()
     except (ValueError, TypeError):
         raise ScriptError("bad_arg", "the public key is not decodable", "key")
-    if not body.startswith(("ssh-", "ecdsa-", "sk-")) or " " not in body:
-        raise ScriptError("bad_arg", "the value is not a public key", "key")
+    body = clean_public_key(body)
     user, path = authorized_key_owner()
     folder = os.path.dirname(path)
     if not os.path.isdir(folder):
         os.makedirs(folder, exist_ok=True)
         os.chmod(folder, 0o700)
     existing = ""
+    if os.path.islink(path):
+        raise ScriptError("bad_arg", "the key file is a link, refusing to write through it", "key")
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             existing = handle.read()
@@ -280,10 +308,14 @@ def add_key(flags):
     if identity in known:
         note("the public key is already present")
         return status(flags)
-    with open(path, "a", encoding="utf-8") as handle:
-        if existing and not existing.endswith("\n"):
-            handle.write("\n")
-        handle.write(body + "\n")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        payload = (("\n" if existing and not existing.endswith("\n") else "") + body + "\n").encode("utf-8")
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     os.chmod(path, 0o600)
     note("the public key is added")
     return status(flags)

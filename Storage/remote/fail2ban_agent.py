@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import os
 import re
 import shutil
@@ -180,6 +181,10 @@ def safe_address(value, label="the ip address"):
     text = str(value or "").strip()
     if not text or not IP_OR_NET.match(text) or ".." in text:
         raise ScriptError("bad_arg", "%s is not an address or a network" % label, "args")
+    try:
+        ipaddress.ip_network(text, strict=False) if "/" in text else ipaddress.ip_address(text)
+    except ValueError:
+        raise ScriptError("bad_arg", "%s is not a real address or network" % label, "args") from None
     return text
 
 

@@ -32,6 +32,11 @@ no `quic`, no `xtls-rprx-direct`.
 ## Layout
 
 ```
+.github/
+  workflows/    ci, security, codeql and the protection drift job
+tools/
+  obhod_watchdog.py           policy assertions and the protection baseline
+  obhod_protection.baseline.json
 BOT/
   app.py        telegram wiring, admin gate, sshd inputs, fail2ban and sshd actions
   panel.py      xray panel, callback router, field validation, subscriptions
@@ -133,6 +138,15 @@ value from the payload, so a value is never left behind in the chat history. Inl
 closed to everyone except the owner: a foreign query gets an empty answer, a foreign `chosen_inline_result` is dropped
 before the rate limiter, and `on_message` runs the same admin gate as every other screen. A repeated value inside eight
 seconds is ignored so a double delivery cannot apply the same write twice.
+
+## Continuous checks
+
+`.github/workflows` runs the suite on every push and pull request: the fast job on Python 3.12, a security job with the
+pentest and hardening files, a wider matrix on `main`, CodeQL with the extended query set, and a protection job that
+fails when a security decision quietly changes. `tools/obhod_watchdog.py` holds the two layers: twelve policy assertions
+over the source, and a sha256 baseline of the thirteen files that carry a security decision. `python
+tools/obhod_watchdog.py verify` is the command that must pass before a merge, `seal` is the deliberate act that accepts a
+new baseline. `CI.md` explains the triggers, the cost, and the one step that lives in the repository settings.
 
 ## Subscriptions
 

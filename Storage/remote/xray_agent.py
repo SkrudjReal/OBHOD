@@ -293,7 +293,8 @@ SAFE_VERSION = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 def safe_url(url, redirect=False):
     if url.startswith("file://"):
         path = os.path.realpath(url[len("file://") :])
-        if not any(path.startswith(os.path.realpath(item)) for item in ALLOWED_FILES):
+        roots = tuple(os.path.realpath(item).rstrip("/") + "/" for item in ALLOWED_FILES)
+        if not any(path.startswith(item) for item in roots):
             raise ScriptError("bad_arg", "a local release must live under /opt, /tmp or /usr/local/bin", "download")
         return url
     parsed = urllib.parse.urlsplit(url)

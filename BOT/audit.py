@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -9,6 +10,11 @@ log = logging.getLogger("obhod.audit")
 MAX_EVENTS = 200
 REPLAY_WINDOW = 2.0
 SECRET_KEYS = ("key", "password", "secret", "token", "seed", "ident", "sub_id", "sub_key", "private")
+CLEAN = re.compile(r"[^ -~]")
+
+
+def clean(value: object, limit: int) -> str:
+    return CLEAN.sub("", str(value or "")).strip()[:limit]
 
 
 def is_secret(name: str) -> bool:
@@ -25,9 +31,9 @@ class Audit:
     def note(self, actor: int, action: str, outcome: str = "ok", detail: str = "") -> None:
         record = {
             "actor": int(actor or 0),
-            "action": str(action or "")[:40],
-            "outcome": str(outcome or "")[:20],
-            "detail": str(detail or "")[:80],
+            "action": clean(action, 40),
+            "outcome": clean(outcome, 20),
+            "detail": clean(detail, 80),
         }
         self.events.append(record)
         if self.sink is not None:
