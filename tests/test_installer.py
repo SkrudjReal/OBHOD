@@ -33,6 +33,7 @@ def test_unit_template_placeholders() -> None:
     assert "@PREFIX@" in body
     assert "@ENV_FILE@" in body
     assert "@STATE_DIR@" in body
+    assert "Environment=HOME=@STATE_DIR@" in body
     assert "ExecStart=@PREFIX@/venv/bin/python -m BOT" in body
     assert "Restart=always" in body
 

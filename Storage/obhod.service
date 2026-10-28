@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=@ENV_FILE@
+Environment=HOME=@STATE_DIR@
 WorkingDirectory=@PREFIX@
 ExecStart=@PREFIX@/venv/bin/python -m BOT
 Restart=always
