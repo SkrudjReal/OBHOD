@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -95,6 +96,36 @@ def key_identity(line):
     return parts[0] + " " + parts[1]
 
 
+def key_list(path):
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        token = line.strip()
+        if not token or token.startswith("#"):
+            continue
+        parts = token.split()
+        if len(parts) < 2:
+            continue
+        kind = parts[0]
+        blob = parts[1]
+        comment = " ".join(parts[2:])[:48] if len(parts) > 2 else ""
+        fingerprint = ""
+        try:
+            padded = blob + "=" * (-len(blob) % 4)
+            digest = hashlib.sha256(base64.b64decode(padded, validate=False)).digest()
+            fingerprint = "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")[:43]
+        except (ValueError, TypeError):
+            fingerprint = ""
+        out.append({"type": kind, "comment": comment, "fingerprint": fingerprint, "bytes": len(blob)})
+        if len(out) >= 32:
+            break
+    return out
+
+
 def key_count(path):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
@@ -125,6 +156,7 @@ def status(_flags):
         "key_user": user,
         "key_path": keys,
         "keys": key_count(keys),
+        "key_list": key_list(keys),
         "service": service,
         "sshd": have("sshd") or os.path.isfile("/usr/sbin/sshd"),
         "systemd": have("systemctl"),
@@ -179,12 +211,16 @@ def apply(flags):
         raise ScriptError("bad_arg", "no ssh option was supplied", "apply")
     if password == "no":
         user, keys = authorized_key_owner()
-        if key_count(keys) < 1:
+        present = key_list(keys)
+        if not present:
             raise ScriptError(
-                "bad_arg",
-                "password login cannot be disabled while the account %s has no authorized key, add a key first" % user,
+                "no_keys",
+                "password login is not touched: the account %s has no public key in %s, so disabling the password "
+                "would lock every login out. Add a key first, then repeat this action." % (user, keys),
                 "apply",
             )
+        if len(present) > 32:
+            raise ScriptError("bad_arg", "the key file is too long to verify safely", "apply")
     lines.append("PubkeyAuthentication yes")
     lines.append("MaxAuthTries 3")
     lines.append("MaxSessions 10")

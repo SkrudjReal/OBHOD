@@ -9,10 +9,12 @@ from typing import Any
 
 from . import i18n
 from .models import SshSettings
+from .freeturn import FtState
 from .xray import SUB_PORT, XrayState
 
 DEFAULT_TAIL = 200
-SCHEMA = 6
+SCHEMA = 7
+CORES = ("xray", "freeturn")
 
 
 class StoreError(Exception):
@@ -29,6 +31,8 @@ class State:
     last_probe: dict[str, Any] = field(default_factory=dict)
     language: str = i18n.DEFAULT_LANGUAGE
     xray: XrayState = field(default_factory=XrayState)
+    freeturn: FtState = field(default_factory=FtState)
+    core: str = "xray"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +44,8 @@ class State:
             "last_probe": dict(self.last_probe),
             "language": i18n.normalize(self.language),
             "xray": self.xray.to_dict(),
+            "freeturn": self.freeturn.to_dict(),
+            "core": self.core if self.core in CORES else "xray",
         }
 
     @staticmethod
@@ -54,7 +60,11 @@ class State:
             last_probe=dict(data.get("last_probe") or {}),
             language=i18n.normalize(data.get("language", i18n.DEFAULT_LANGUAGE)),
             xray=XrayState.from_dict(data.get("xray")),
+            freeturn=FtState.from_dict(data.get("freeturn")),
+            core=str(data.get("core", "xray") or "xray"),
         )
+        if state.core not in CORES:
+            state.core = "xray"
         state.xray.sub_port = state.sub_port
         return state
 

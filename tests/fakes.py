@@ -20,13 +20,33 @@ class FakeEvent:
         self.cmd = kwargs.get("cmd", "")
         self.query = kwargs.get("query", "")
         self.src = kwargs.get("src", "mt")
+        self.update_type = kwargs.get("update_type", "")
+        self.raw = kwargs.get("raw", {})
         self.answers: list[Any] = []
         self.results: list[dict] = []
 
-    async def answer(self, text: str = "", alert: bool = False, results: list[dict] | None = None, cache_time: int = 0) -> None:
-        self.answers.append({"text": text, "alert": alert, "results": results, "cache_time": cache_time})
+    async def answer(self, text: str = "", alert: bool = False, results: list[dict] | None = None, cache_time: int = 0, **kw: Any) -> None:
+        self.answers.append(
+            {
+                "text": text,
+                "alert": alert,
+                "results": results,
+                "cache_time": cache_time,
+                "is_personal": kw.get("is_personal"),
+            }
+        )
         if results is not None:
             self.results = results
+
+
+class FakeApp:
+    def __init__(self) -> None:
+        self.deleted: list[tuple[int, int]] = []
+
+    async def delete_msg(self, chat_id: int, msg_ids: int | list[int], **kw: Any) -> None:
+        items = msg_ids if isinstance(msg_ids, list) else [msg_ids]
+        for item in items:
+            self.deleted.append((int(chat_id), int(item)))
 
 
 class FakeControl:
@@ -167,7 +187,15 @@ class FakeGuard:
 
     async def ssh_status(self, cfg: Any) -> SshState:
         self.calls.append("ssh_status")
-        return SshState(ports=[22], permit_root_login="prohibit-password", service="active", keys=1, key_user="root")
+        return SshState(
+            ports=[22],
+            permit_root_login="prohibit-password",
+            service="active",
+            keys=1,
+            key_user="root",
+            key_path="/root/.ssh/authorized_keys",
+            key_list=[{"type": "ssh-ed25519", "comment": "laptop", "fingerprint": "SHA256:abc", "bytes": 68}],
+        )
 
     async def ssh_apply(self, cfg: Any, port: int = 0, password: str = "", root: str = "") -> SshState:
         self.calls.append("ssh_apply")
@@ -180,6 +208,125 @@ class FakeGuard:
     async def ssh_remove(self, cfg: Any) -> SshState:
         self.calls.append("ssh_remove")
         return SshState(ports=[22], dropin_exists=False)
+
+
+class FakeFtControl:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.fail = ""
+        self.key = "c" * 64
+
+    def _link(self, name: str) -> str:
+        from BOT.freeturn import encode_link
+
+        return encode_link(
+            {
+                "v": 1,
+                "provider": "vk",
+                "peer": "203.0.113.10:56123",
+                "obf": "rtpopus3",
+                "key": self.key,
+                "cid": "0123456789abcdef0123456789abcdef",
+                "name": name,
+            }
+        )
+
+    def _conf(self) -> str:
+        import base64
+
+        body = "[Interface]\nPrivateKey = abc\nMTU = 1420\n# note\n\n[Peer]\nPublicKey = def\n"
+        return base64.b64encode(body.encode("utf-8")).decode("ascii")
+
+    async def probe(self) -> Any:
+        from BOT.freeturn import FtState
+
+        self.calls.append(["probe"])
+        return FtState.from_dict(
+            {
+                "installed": True,
+                "running": True,
+                "euid": 0,
+                "arch": "x86_64",
+                "method": "systemd",
+                "version": "v4.1.0",
+                "config": {
+                    "method": "systemd",
+                    "backend": "new",
+                    "listen_port": 56123,
+                    "mode": "udp",
+                    "obf_profile": "rtpopus3",
+                    "obf_key": self.key,
+                    "version": "latest",
+                },
+            }
+        )
+
+    async def apply(self, config: Any, update: bool = False, obf_key: str = "") -> Any:
+        from BOT.freeturn import FtState
+
+        self.calls.append(["apply", config.method, str(config.listen_port), obf_key])
+        return FtState.from_dict(
+            {
+                "installed": True,
+                "running": True,
+                "euid": 0,
+                "arch": "x86_64",
+                "method": config.method,
+                "version": "v4.1.0",
+                "config": dict(config.to_dict(), obf_key=self.key),
+            }
+        )
+
+    async def stop(self) -> Any:
+        from BOT.freeturn import FtResponse
+
+        self.calls.append(["stop"])
+        return FtResponse(result="ok", data={"stopped": True})
+
+    async def restart(self) -> Any:
+        from BOT.freeturn import FtResponse
+
+        self.calls.append(["restart"])
+        return FtResponse(result="ok", data={"running": True})
+
+    async def logs(self, tail: int = 120) -> list[str]:
+        self.calls.append(["logs", str(tail)])
+        return ["line one", "line two"]
+
+    async def client_list(self) -> Any:
+        from BOT.freeturn import FtClient, FtShare
+
+        self.calls.append(["client-list"])
+        clients = [FtClient(name="owner", client_id="0123456789abcdef0123456789abcdef", owner=True)]
+        share = FtShare(backend="new", host="203.0.113.10", port=56123, mode="udp", obf_profile="rtpopus3", key_present=True)
+        return clients, share
+
+    async def client_add(self, name: str) -> Any:
+        from BOT.freeturn import FtClient
+
+        self.calls.append(["client-add", name])
+        return FtClient(name=name, client_id="ffeeddccbbaa99887766554433221100"), self._link(name), self._conf()
+
+    async def client_conf(self, name: str) -> Any:
+        from BOT.freeturn import FtClient
+
+        self.calls.append(["client-conf", name])
+        owner = name == "owner"
+        return FtClient(name=name, client_id="0123456789abcdef0123456789abcdef", owner=owner), self._link(name), self._conf()
+
+    async def client_remove(self, name: str) -> Any:
+        from BOT.freeturn import FtError, FtResponse
+
+        self.calls.append(["client-remove", name])
+        if name == "owner":
+            raise FtError("the owner client cannot be removed", "owner_protected")
+        return FtResponse(result="ok", data={"removed": True})
+
+    async def uninstall(self, target: str = "all", purge: bool = True) -> Any:
+        from BOT.freeturn import FtResponse
+
+        self.calls.append(["uninstall", target])
+        return FtResponse(result="ok", data={})
 
 
 def make_config(state_dir: Path) -> SimpleNamespace:
@@ -209,6 +356,7 @@ def make_bot(tmp_path: Path) -> Bot:
 
     bot.send = send
     bot.render = render
+    bot.app = FakeApp()
     return bot
 
 

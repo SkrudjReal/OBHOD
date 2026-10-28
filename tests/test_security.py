@@ -480,13 +480,11 @@ def test_the_removed_transport_is_gone() -> None:
 
 
 def test_the_ui_has_no_credential_fields(tmp_path: Path) -> None:
-    from tests.fakes import FakeEvent
-
     bot = make_bot(tmp_path)
     for ident in ("ssh_host", "ssh_user", "ssh_password", "ssh_key", "ssh_sudo"):
         assert ident not in inline.FIELDS
         assert ident not in bot.input_values()
-        asyncio.run(bot.on_input(FakeEvent(), ident, "-", "203.0.113.10"))
+        asyncio.run(bot.dispatch_input(7, ident, "-", "203.0.113.10"))
         assert not hasattr(bot.state.ssh, ident.replace("ssh_", ""))
     values = bot.input_values()
     assert "ssh_new_port" in values

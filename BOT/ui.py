@@ -9,6 +9,7 @@ from goygram.rich import Rich
 from . import i18n
 
 MAX_BUTTONS = 18
+COPY_TEXT_LIMIT = 256
 MAX_CALLBACK = 64
 SEP = " · "
 
@@ -58,8 +59,48 @@ def copy_button(label: str, text: str) -> str:
     return f'<tg-button type="copy_text" text="{esc(text)}">{esc(label)}</tg-button>'
 
 
+def copy_row(label: str, text: str) -> str:
+    token = str(text or "")
+    if not token or len(token) > COPY_TEXT_LIMIT:
+        return ""
+    return row(copy_button(label, token))
+
+
+def long_payload(text: str, limit: int = 3500) -> str:
+    token = str(text or "")
+    if not token:
+        return ""
+    return pre(token[:limit])
+
+
+def long_block(title: str, text: str, limit: int = 3500) -> str:
+    body = long_payload(text, limit)
+    if not body:
+        return ""
+    return details(title, body)
+
+
+def fitted(label: str, text: str, lang: str = i18n.DEFAULT_LANGUAGE) -> tuple[str, str]:
+    button = copy_row(label, text)
+    if button:
+        return button, ""
+    block = long_block(i18n.t("UI_LONG_TITLE", lang), text)
+    if not block:
+        return "", ""
+    return "", block + f"<p>{muted(i18n.t('UI_LONG_HINT', lang))}</p>"
+
+
 def link_button(label: str, url: str) -> str:
     return f'<tg-button type="url" url="{esc(url)}">{esc(label)}</tg-button>'
+
+
+def input_row(label: str, ident: str, ctx: object = "-", lang: str = "en") -> str:
+    from . import i18n, inline
+
+    buttons = [inline_button(label, inline.prefill(ident, ctx))]
+    if inline.has_options(ident):
+        buttons.append(inline_button(i18n.t("BTN_LIST", lang), inline.list_query(ident, ctx)))
+    return row(*buttons)
 
 
 def inline_button(label: str, query: str, style: str = "") -> str:

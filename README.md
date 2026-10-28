@@ -18,11 +18,15 @@ no `quic`, no `xtls-rprx-direct`.
 | VLESS encryption | `mlkem768x25519plus.<native\|xorpub\|random>.<600s\|300-600s\|0s>[.<padding>].<key>` |
 | REALITY signature | optional `ML-DSA-65`, enabled only when the target chain is at least 3500 bytes |
 | Core | Xray pinned to `v26.10.21`, `latest` also selectable, release zip checked against a pinned digest |
+| Second core | FreeTurn (`vk` turn transport) v4.1.0, install script fetched from the release on every call and checked against a pinned digest |
+| Core switch | `Core switch` screen picks Xray or FreeTurn for the interface, both cores may run side by side |
 | Scanner | certificate check, TLS 1.3, `h2`, and a raw ClientHello carrying a real ML-KEM-768 key share |
 | Subscriptions | `http://host:port/<64 chars>/<64 chars>`, both segments from `secrets`, url safe alphabet |
 | Fail2ban | jail `3x-ipl` plus `obhod-sshd`, iptables chain `OBHOD-IPL` with exempt ports |
 | SSH | port, password login, root login and public keys managed by a script that runs on the server |
-| Interface | rich GoyGram messages, only `callback_data` buttons, every input through inline query |
+| SSH key gate | the password switch is refused while the account has no public key, the screen lists the keys that open this machine with their `SHA256` fingerprints |
+| Interface | rich GoyGram messages, only `callback_data` buttons, every input through an opaque inline token |
+| Inline values | a fixed set of choices (fingerprint, alpn, flow, log level, ports, durations) is returned as inline results, never typed |
 | Languages | `en`, `ru`, `zh`, chosen in the menu and stored in the bot state, English by default and as the fallback |
 
 ## Layout
@@ -33,6 +37,9 @@ BOT/
   panel.py      xray panel, callback router, field validation, subscriptions
   screens.py    home, ssh access, settings, fail2ban, sshd, help
   xscreens.py   xray screens, relevant fields per security and network
+  freeturn.py   freeturn models, plan validation, proto 3 client, link codec
+  ftpanel.py    freeturn callback router, plan cycles, clients, core switch
+  ftscreens.py  freeturn screens, plan, clients, owner link, logs
   xray.py       vless model, post quantum encryption, links, config, state
   scan.py       post quantum probe, certificate parsing, ranking, candidate list
   xrayrpc.py    RPC client, script bootstrap, subscription state
@@ -45,17 +52,33 @@ BOT/
   i18n.py       lookup by variable, fallback to English, the language switch
   strings.py    classes EN, RU and ZH with identical variables
   ui.py         rich html helpers
-  inline.py     inline query fields
+  inline.py     inline tokens, fixed value lists, marker payloads
 Storage/
   remote/xray_agent.py    core install, config apply, keys, subscription service
   remote/sub_server.py    subscription http server
   remote/fail2ban_agent.py jail, filter, action, bans
   remote/ssh_agent.py     sshd drop in, keys, restart
+  remote/freeturn_agent.py  install script download with a pinned digest, proto 3 runner
   obhod-install.sh        bot installer
   obhod.service           bot unit
 get.sh                      curl one liner
 tests/                      test suite
 ```
+
+## FreeTurn core
+
+FreeTurn is a second engine next to Xray, driven through the same proto 3 envelope, so one code path parses both answers.
+
+| Point | Behaviour |
+| --- | --- |
+| Script source | `https://github.com/hackdiaz-dev/free-turn-proxy/releases/download/v4.1.0/install.sh`, https only, github hosts only, certificate verified |
+| Integrity | sha256 `91fcea2aa5558d019431da31aa1f32baa0ffb943600529810e073ffa22f83100`, a mismatch stops the run before anything executes |
+| Cache | `/var/lib/obhod/freeturn`, directory 0700, file 0600, digest rechecked on every read |
+| Invocation | `bash <script> <command> --key=value`, argv only, no shell, stdin closed, per command timeouts |
+| Plan fields | method `systemd\|docker`, backend `new\|external`, udp port, tunnel port and subnet, mode `udp\|tcp`, obfuscation `rtpopus3\|rtpopus2\|rtpopus\|none`, core version |
+| Secrets | the obfuscation key and client ids stay on the server, the bot keeps only the fact that a key exists |
+| Clients | `owner` is protected, guests are added by name, each guest gets a completed `freeturn://` link and a cleaned client config |
+| Errors | the script code set is mapped to localized text, unknown codes fall back to the message from the script |
 
 ## Crypto decisions
 
@@ -71,13 +94,45 @@ tests/                      test suite
 
 ## Localization
 
-Every user facing string lives in `BOT/strings.py` as a class variable: `EN`, `RU` and `ZH` hold the same set of 583
+Every user facing string lives in `BOT/strings.py` as a class variable: `EN`, `RU` and `ZH` hold the same set of 746
 variables, the Chinese column is written in Chinese, and parameterized strings use `{placeholders}`. `BOT/i18n.py` looks a
 variable up by name (`i18n.t("HOME_TITLE", "ru")`), normalizes a language tag, falls back to English, refuses a key that is
 missing or a call that forgets a placeholder, and exposes `check_catalogs()` for the parity test. The bot starts in
 English, the language screen lists `en`, `ru` and `zh`, the choice is written into the state file by `store.py` and every
 later message, button, hint, error and inline result is rendered in it. Raise messages, log records, RPC stages and shell
 output stay English and are deliberately outside the catalogue.
+
+## Inline input
+
+A text value is never carried by a button. `BOT/inline.py` keeps a registry of `(field, context, mode)` triples and maps
+each of them to a ten character token from `[a-z2-7]`, the first ten characters of an `hmac_sha256` over
+`mode|field|context` with a key generated once at start (`inline.configure` accepts a hex secret, otherwise hashes it, and
+falls back to `os.urandom(32)`). The token for the same triple is always the same inside one process, so a button that the
+user presses twice behaves the same way, while two different fields never share a token and the input mode and the list
+mode of one field differ on purpose.
+
+The result of pressing an input button is `switch_inline_query_current_chat` with `"<token> "`, so the query field shows
+`@bot oxw2xbkugl` and nothing else, which is exactly the Feroku flow: the user types the value after the code and the bot
+resolves the code back to the field. While the value is being typed the single result is titled with a cycling symbol
+(`ABXY`, `1234`, `abcd`, `wxyz` by length) so the list visibly reacts.
+
+A field with a fixed set of values (`xr_fingerprint`, `xr_alpn`, `xr_client_flow`, `xr_log_level`, `xr_port`,
+`xr_sub_port`, `xr_bantime`, `xr_ssh_bantime`, `xr_ssh_maxretry`, `xr_scan_xver`, `xr_spider_x`, `xr_client_limit`,
+`xr_sub_refresh`, `ft_port`, `ft_wg_port`, `ft_wg_net`, `ssh_new_port`) has two
+buttons: the pen prefills the input token and the list button prefills the list token. The list token returns one card per
+allowed value, nothing to type, the same idea as `DevTool.py` in `i-execute/Modules`. A field without a fixed set (sni,
+remark, dns, targets, a public key) has only the pen.
+
+The chosen value comes back through the `chosen_inline_result` update, which the bot registers with `app.on_update`; the
+update carries the result id (`i:<token>`, `o:<token>:<index>`, `s:<token>` for a stale token) and the query, and the bot
+resolves the value itself instead of trusting the text. BotFather has to hand that update to the bot: send `/setinline`,
+then `/setinlinefeedback` and pick `Enabled` for the bot, otherwise Telegram sends the query but never the choice.
+When the inline query is sent as a message in a chat, the bot also receives a marker (`\U0001F4DD` followed by an
+invisible separator, the token and a base 32 payload), deletes that message at once with `deleteMessage`, and applies the
+value from the payload, so a value is never left behind in the chat history. Inline and the direct message path are both
+closed to everyone except the owner: a foreign query gets an empty answer, a foreign `chosen_inline_result` is dropped
+before the rate limiter, and `on_message` runs the same admin gate as every other screen. A repeated value inside eight
+seconds is ignored so a double delivery cannot apply the same write twice.
 
 ## Subscriptions
 
@@ -216,9 +271,10 @@ started as `obhod.service`. Reinstalling removes the previous installation first
 python -m pytest
 ```
 
-574 tests cover the post quantum encryption strings, links, config generation, state, subscriptions, the scanner, every
-screen, every callback route, the admin gate, the panel field rules, the fail2ban files, the ssh agent, the local shell and the running
-subscription server, plus the three catalogues, their placeholder parity and the hardening suite in
+767 tests cover the post quantum encryption strings, links, config generation, state, subscriptions, the scanner, every
+screen, every callback route, the admin gate, the panel field rules, the fail2ban files, the ssh agent, the ssh key gate, the local shell, the running
+subscription server, the freeturn plan rules, the link codec, the proto 3 client, the freeturn agent including digest, host and
+injection refusals, the freeturn screens and router, plus the three catalogues, their placeholder parity and the hardening suite in
 `tests/test_security.py`. `tests/test_source.py` fails the build if any
 Python comment, docstring, emoji or long dash appears in the repository, and if any Cyrillic or CJK character appears
 outside `BOT/strings.py`.

@@ -94,6 +94,7 @@ class SshState:
     key_user: str = ""
     key_path: str = ""
     keys: int = 0
+    key_list: list[dict[str, Any]] = field(default_factory=list)
     service: str = ""
     sshd: bool = False
     systemd: bool = False
@@ -113,6 +114,16 @@ class SshState:
             key_user=str(data.get("key_user", "") or ""),
             key_path=str(data.get("key_path", "") or ""),
             keys=int(data.get("keys", 0) or 0),
+            key_list=[
+                {
+                    "type": str(item.get("type", "") or "")[:32],
+                    "comment": str(item.get("comment", "") or "")[:48],
+                    "fingerprint": str(item.get("fingerprint", "") or "")[:64],
+                    "bytes": int(item.get("bytes", 0) or 0),
+                }
+                for item in data.get("key_list") or []
+                if isinstance(item, dict)
+            ][:32],
             service=str(data.get("service", "") or ""),
             sshd=bool(data.get("sshd", False)),
             systemd=bool(data.get("systemd", False)),
@@ -131,6 +142,7 @@ class SshState:
             "key_user": self.key_user,
             "key_path": self.key_path,
             "keys": int(self.keys),
+            "key_list": list(self.key_list),
             "service": self.service,
             "sshd": self.sshd,
             "systemd": self.systemd,

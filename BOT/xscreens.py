@@ -3,14 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import i18n
+from . import i18n, inline
 from .scan import ScanResult
 from .ui import (
     bold,
     bullet_list,
     button,
     code,
-    copy_button,
+    input_row,
+    fitted,
     details,
     divider,
     heading,
@@ -194,16 +195,10 @@ def custom_menu(view: XrayView) -> Any:
     buttons = [
         row(button(t("XR_CUSTOM_NETWORK"), "xr:cyc:network"), button(t("XR_CUSTOM_SECURITY"), "xr:cyc:security")),
         row(button(t("UI_CREATE"), "xr:create")),
-        row(inline_button(t("XR_CUSTOM_PORT"), inline_prefill("xr_port"))),
+        input_row(t("XR_CUSTOM_PORT"), "xr_port", "-", view.lang),
         back_row(),
     ]
     return screen(t("XR_CUSTOM_TITLE"), t("XR_CUSTOM_SUBTITLE"), blocks, buttons)
-
-
-def inline_prefill(ident: str, ctx: str = "-") -> str:
-    from . import inline
-
-    return inline.prefill(ident, ctx)
 
 
 def grab(view: XrayView, key: str) -> str:
@@ -263,11 +258,12 @@ def inbound_screen(view: XrayView, inbound: XrayInbound) -> Any:
 
 
 def field_row(inbound: XrayInbound, lang: str) -> str:
-    names = relevant_fields(inbound.security, inbound.network)
-    buttons = [inline_button(field_label(name, lang), inline_prefill(FIELD_BUTTONS[name], str(inbound.id))) for name in names if name in FIELD_BUTTONS]
-    if not buttons:
+    names = [name for name in relevant_fields(inbound.security, inbound.network) if name in FIELD_BUTTONS]
+    if not names:
         return ""
-    return row(*buttons[:2])
+    manual = row(*[inline_button(field_label(name, lang), inline.prefill(FIELD_BUTTONS[name], str(inbound.id))) for name in names[:2]])
+    picks = [inline_button(i18n.t("BTN_LIST", lang), inline.list_query(FIELD_BUTTONS[name], str(inbound.id))) for name in names if inline.has_options(FIELD_BUTTONS[name])]
+    return manual + row(*picks[:2] if picks else [])
 
 
 def links_screen(view: XrayView, inbound: XrayInbound, address: str, links: list[tuple[str, str]]) -> Any:
@@ -276,11 +272,17 @@ def links_screen(view: XrayView, inbound: XrayInbound, address: str, links: list
     blocks.append(f"<p>{t('XR_LINKS_ADDRESS', address=code(address))}</p>")
     if not links:
         blocks.append(quote(bold(t("XR_LINKS_EMPTY"))))
+    copyable = []
     for name, link in links[:MAX_LINKS]:
         blocks.append(heading(name, 4))
-        blocks.append(pre(link))
+        button_html, block_html = fitted(t("XR_LINKS_COPY", name=name), link, view.lang)
+        if button_html:
+            copyable.append(row(button_html))
+            blocks.append(pre(link))
+        elif block_html:
+            blocks.append(block_html)
     buttons = [
-        row(*[copy_button(t("XR_LINKS_COPY", name=name), link) for name, link in links[:2]]),
+        *copyable,
         row(button(t("UI_REFRESH"), f"xr:link:{inbound.id}"), button(t("XR_BTN_INBOUND"), f"xr:in:{inbound.id}")),
         back_row("xr:home"),
     ]
@@ -305,12 +307,14 @@ def client_screen(view: XrayView, inbound: XrayInbound, email: str, link: str, s
     if sub_path:
         pairs.append((t("XR_CLIENT_SUB_PATH"), code(sub_path)))
     blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
-    if link:
-        blocks.append(pre(link))
-    if sub_url:
-        blocks.append(f"<p>{t('XR_CLIENT_SUB_URL', url=code(sub_url))}</p>")
+    link_button, link_block = fitted(t("XR_CLIENT_COPY"), link, view.lang)
+    if link_block:
+        blocks.append(link_block)
+    sub_button, sub_block = fitted(t("XR_CLIENT_SUB"), sub_url, view.lang)
+    if sub_block:
+        blocks.append(sub_block)
     buttons = [
-        row(copy_button(t("XR_CLIENT_COPY"), link)) if link else "",
+        link_button,
         row(button(t("XR_CLIENT_SUB"), f"xr:sub:{inbound.id}:{client.email}"), button(t("XR_CLIENT_NEW_PATH"), f"xr:subrot:{inbound.id}:{client.email}")),
         row(button(t("XR_CLIENT_FLOW_BTN"), f"xr:clflow:{inbound.id}:{client.email}"), button(t("XR_CLIENT_LIMIT_BTN"), f"xr:cllimit:{inbound.id}:{client.email}")),
         row(button(t("UI_DELETE_CLIENT"), f"xr:cldel:{inbound.id}:{client.email}"), button(t("XR_BTN_INBOUND"), f"xr:in:{inbound.id}")),
@@ -331,10 +335,8 @@ def mldsa_screen(view: XrayView, inbound: XrayInbound) -> Any:
     blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
     blocks.append(quote(muted(t("XR_MLDSA_NOTE"))))
     buttons = [
-        row(
-            inline_button(t("XR_MLDSA_SEED"), inline_prefill("xr_mldsa65_seed", str(inbound.id))),
-            inline_button(t("XR_MLDSA_VERIFY_BTN"), inline_prefill("xr_mldsa65_verify", str(inbound.id))),
-        ),
+        input_row(t("XR_MLDSA_SEED"), "xr_mldsa65_seed", str(inbound.id), view.lang),
+        input_row(t("XR_MLDSA_VERIFY_BTN"), "xr_mldsa65_verify", str(inbound.id), view.lang),
         row(button(t("UI_GENERATE"), f"xr:mldsa:{inbound.id}:gen"), button(t("UI_REMOVE"), f"xr:mldsa:{inbound.id}:clear")),
         back_row(f"xr:in:{inbound.id}"),
     ]
@@ -362,8 +364,9 @@ def subs_screen(view: XrayView, rows_data: list[tuple[str, str, str]]) -> Any:
     buttons = [
         row(button(t("XR_SUBS_APPLY"), "xr:subs:apply"), button(t("XR_SUBS_STATUS"), "xr:subs:status")),
         row(button(t("XR_SUBS_STOP"), "xr:subs:stop"), button(t("XR_SUBS_ROTATE"), "xr:subs:rotate")),
-        row(inline_button(t("XR_SUBS_PORT"), inline_prefill("xr_sub_port")), inline_button(t("XR_SUBS_ADDRESS"), inline_prefill("xr_sub_address"))),
-        row(inline_button(t("SET_SUB_REFRESH"), inline_prefill("xr_sub_refresh"))),
+        input_row(t("XR_SUBS_PORT"), "xr_sub_port", "-", view.lang),
+        input_row(t("XR_SUBS_ADDRESS"), "xr_sub_address", "-", view.lang),
+        input_row(t("SET_SUB_REFRESH"), "xr_sub_refresh", "-", view.lang),
         back_row("xr:home"),
     ]
     return screen(t("XR_SUBS_TITLE"), t("XR_SUBS_SUBTITLE"), blocks, buttons)
@@ -431,8 +434,10 @@ def scan_screen(view: XrayView, results: list[ScanResult] | None = None) -> Any:
         blocks.append(quote(muted(t("XR_SCAN_EMPTY"))))
     buttons = [
         row(button(t("XR_SCAN_RUN"), "xr:scan:run"), button(t("XR_SCAN_MY_TARGETS"), "xr:scan:targets")),
-        row(inline_button(t("XR_SCAN_OWN_TARGET"), inline_prefill("xr_scan_manual")), button(t("XR_SCAN_RESET"), "xr:scan:reset")),
-        row(inline_button(t("SET_SCAN_SNI"), inline_prefill("xr_scan_sni")), inline_button(t("SET_SCAN_XVER"), inline_prefill("xr_scan_xver"))),
+        input_row(t("XR_SCAN_OWN_TARGET"), "xr_scan_manual", "-", view.lang),
+        row(button(t("XR_SCAN_RESET"), "xr:scan:reset")),
+        input_row(t("SET_SCAN_SNI"), "xr_scan_sni", "-", view.lang),
+        input_row(t("SET_SCAN_XVER"), "xr_scan_xver", "-", view.lang),
     ]
     if rows:
         buttons.insert(1, row(*[button(t("XR_SCAN_USE", target=item.target), f"xr:scan:use:{index}") for index, item in enumerate(rows[:3])]))
@@ -448,8 +453,8 @@ def scan_targets_screen(view: XrayView) -> Any:
     blocks.append(f"<p>{t('XR_TARGETS_CANDIDATES', count=code(len(view.state.candidates())))}</p>")
     blocks.append(pre("\n".join(view.state.candidates()[:12])))
     buttons = [
-        row(inline_button(t("XR_TARGETS_EDIT"), inline_prefill("xr_scan_targets"))),
-        row(inline_button(t("XR_TARGETS_EDIT_CANDIDATES"), inline_prefill("xr_scan_candidates"))),
+        input_row(t("XR_TARGETS_EDIT"), "xr_scan_targets", "-", view.lang),
+        input_row(t("XR_TARGETS_EDIT_CANDIDATES"), "xr_scan_candidates", "-", view.lang),
         row(button(t("XR_TARGETS_DEFAULT"), "xr:scan:reset"), button(t("NAV_SCANNER"), "xr:scan")),
         back_row("xr:home"),
     ]
@@ -467,7 +472,7 @@ def input_screen(view: XrayView, ident: str, ctx: str = "", back: str = "xr:home
         blocks.append(f"<p>{t('PROMPT_EXAMPLE', example=code(item.example))}</p>")
     blocks.append(quote(muted(t("XR_INPUT_NOTE"))))
     buttons = [
-        row(inline_button(t("PROMPT_INPUT"), inline.prefill(ident, ctx or "-"))),
+        input_row(t("PROMPT_INPUT"), ident, ctx or "-", view.lang),
         row(button(t("UI_BACK"), back), button(t("NAV_XRAY"), "xr:home")),
     ]
     return screen(t("PROMPT_TITLE"), item.label(view.lang), blocks, buttons)

@@ -12,7 +12,8 @@ from .ui import (
     bullet_list,
     button,
     code,
-    copy_button,
+    input_row,
+    fitted,
     details,
     divider,
     heading,
@@ -109,8 +110,9 @@ def home(view: View) -> Any:
         rows = [(f"{item.id} {item.remark}", f"{item.port} {item.network} {item.security}") for item in xray.inbounds]
         blocks.append(table(rows, (t("HOME_TABLE_HEADER"), t("HOME_TABLE_HEADER2"))))
     buttons = [
-        row(button(t("NAV_XRAY"), "xr:home"), button(t("NAV_SCANNER"), "xr:scan")),
-        row(button(t("NAV_SUBS"), "xr:subs"), button(t("NAV_CORE"), "xr:core")),
+        row(button(t("NAV_XRAY"), "xr:home"), button(t("NAV_FREETURN"), "ft:home")),
+        row(button(t("NAV_SCANNER"), "xr:scan"), button(t("NAV_SUBS"), "xr:subs")),
+        row(button(t("NAV_CORE"), "xr:core"), button(t("CORE_NAV"), "core:show")),
         row(button(t("NAV_FAIL2BAN"), "nav:ban"), button(t("NAV_SSHD"), "nav:sshd")),
         row(button(t("NAV_SSH"), "nav:ssh"), button(t("NAV_SETTINGS"), "nav:settings")),
         row(button(t("NAV_LANGUAGE"), "nav:lang"), button(t("NAV_HELP"), "nav:help")),
@@ -147,17 +149,12 @@ def ssh_settings(view: View) -> Any:
     blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
     blocks.append(quote(muted(t("SSH_NO_PASSWORD"))))
     buttons = [
-        row(inline_button(t("SSH_LABEL_PORT"), i18n_field("ssh_new_port")), inline_button(t("SSHD_NOTICE_KEY"), i18n_field("ssh_pubkey"))),
+        input_row(t("SSH_LABEL_PORT"), "ssh_new_port", "-", view.lang),
+        input_row(t("SSHD_NOTICE_KEY"), "ssh_pubkey", "-", view.lang),
         row(button(t("SSHD_BTN_CHECK"), "sshd:status"), button(t("SSHD_PW_OFF"), "sshd:auth:no")),
         row(button(t("UI_HOME"), "nav:home")),
     ]
     return screen(t("SSH_TITLE"), t("SSH_SUBTITLE"), blocks, buttons)
-
-
-def i18n_field(ident: str, ctx: str = "-") -> str:
-    from . import inline
-
-    return inline.prefill(ident, ctx)
 
 
 def settings(view: View) -> Any:
@@ -190,10 +187,14 @@ def settings(view: View) -> Any:
     blocks.append(quote(muted(t("SET_NOTE_SUB_PATH"))))
     buttons = [
         row(button(t("SET_VERSION_PINNED", version=xray.pinned()), "xr:core:ver:pin"), button(t("SET_VERSION_LATEST"), "xr:core:ver:latest")),
-        row(inline_button(t("SET_LOG_LEVEL"), i18n_field("xr_log_level")), inline_button(t("SET_SUB_PORT"), i18n_field("xr_sub_port"))),
-        row(inline_button(t("SET_SUB_ADDRESS"), i18n_field("xr_sub_address")), inline_button(t("SET_CANDIDATES"), i18n_field("xr_scan_candidates"))),
-        row(inline_button(t("SET_API_PORT"), i18n_field("xr_api_port")), inline_button(t("SET_ACCESS_LOG"), i18n_field("xr_access_log"))),
-        row(inline_button(t("SET_DNS"), i18n_field("xr_dns_servers")), button(t("NAV_LANGUAGE"), "nav:lang")),
+        input_row(t("SET_LOG_LEVEL"), "xr_log_level", "-", view.lang),
+        input_row(t("SET_SUB_PORT"), "xr_sub_port", "-", view.lang),
+        input_row(t("SET_SUB_ADDRESS"), "xr_sub_address", "-", view.lang),
+        input_row(t("SET_CANDIDATES"), "xr_scan_candidates", "-", view.lang),
+        input_row(t("SET_API_PORT"), "xr_api_port", "-", view.lang),
+        input_row(t("SET_ACCESS_LOG"), "xr_access_log", "-", view.lang),
+        input_row(t("SET_DNS"), "xr_dns_servers", "-", view.lang),
+        row(button(t("NAV_LANGUAGE"), "nav:lang")),
         row(button(t("UI_HOME"), "nav:home")),
     ]
     return screen(t("SET_TITLE"), t("SET_SUBTITLE"), blocks, buttons)
@@ -245,9 +246,11 @@ def ban_screen(view: View) -> Any:
     )
     buttons = [
         row(button(t("FB_BTN_ENABLE"), "fb:install"), button(t("FB_BTN_CHECK"), "fb:status")),
-        row(inline_button(t("FB_BANTIME"), i18n_field("xr_bantime")), inline_button(t("FB_IP_FIELD"), i18n_field("xr_ban_ip"))),
-        row(inline_button(t("SET_SSH_BANTIME"), i18n_field("xr_ssh_bantime")), inline_button(t("SET_SSH_MAXRETRY"), i18n_field("xr_ssh_maxretry"))),
-        row(inline_button(t("SET_IGNOREIP"), i18n_field("xr_ignoreip"))),
+        input_row(t("FB_BANTIME"), "xr_bantime", "-", view.lang),
+        input_row(t("FB_IP_FIELD"), "xr_ban_ip", "-", view.lang),
+        input_row(t("SET_SSH_BANTIME"), "xr_ssh_bantime", "-", view.lang),
+        input_row(t("SET_SSH_MAXRETRY"), "xr_ssh_maxretry", "-", view.lang),
+        input_row(t("SET_IGNOREIP"), "xr_ignoreip", "-", view.lang),
         row(button(t("FB_BTN_RESET"), "fb:reset"), button(t("FB_BTN_DISABLE"), "fb:remove")),
         row(button(t("UI_HOME"), "nav:home")),
     ]
@@ -275,9 +278,23 @@ def sshd_screen(view: View) -> Any:
         blocks.append(table(pairs, (t("UI_FIELD"), t("UI_VALUE"))))
         state = t("SSHD_CREATED") if item.dropin_exists else t("SSHD_NOT_CREATED")
         blocks.append(f"<p>{t('SSHD_DROPIN', path=code(item.dropin), state=muted(state))}</p>")
+        blocks.append(heading(t("SSHD_KEYS_TITLE"), 3))
+        if item.key_list:
+            rows = []
+            for index, key in enumerate(item.key_list, 1):
+                name = key.get("comment") or t("UI_NONE")
+                rows.append((t("SSHD_KEY_ROW", count=index, kind=key.get("type", ""), comment=name), key.get("fingerprint") or t("SSHD_KEY_BYTES", bytes=int(key.get("bytes", 0)))))
+            blocks.append(table(rows, (t("SSHD_KEYS"), t("UI_VALUE"))))
+            blocks.append(f"<p>{muted(t('SSHD_PW_READY', count=len(item.key_list)))}</p>")
+        else:
+            blocks.append(quote(bold(t("SSHD_KEYS_EMPTY", path=item.key_path or "~/.ssh/authorized_keys", user=item.key_user or "root"))))
+            blocks.append(f"<p>{muted(t('SSHD_KEYS_HINT'))}</p>")
+            blocks.append(f"<p>{muted(t('SSHD_PW_BLOCKED', user=item.key_user or 'root', path=item.key_path or '~/.ssh/authorized_keys'))}</p>")
+        blocks.append(f"<p>{muted(t('SSHD_KEYS_ONLY'))}</p>")
     buttons = [
         row(button(t("SSHD_BTN_CHECK"), "sshd:status")),
-        row(inline_button(t("SSHD_NEW_PORT"), i18n_field("ssh_new_port")), inline_button(t("SSHD_PUBKEY"), i18n_field("ssh_pubkey"))),
+        input_row(t("SSHD_NEW_PORT"), "ssh_new_port", "-", view.lang),
+        input_row(t("SSHD_PUBKEY"), "ssh_pubkey", "-", view.lang),
         row(button(t("SSHD_PW_OFF"), "sshd:auth:no"), button(t("SSHD_PW_ON"), "sshd:auth:yes")),
         row(button(t("SSHD_ROOT_KEY"), "sshd:root:prohibit-password"), button(t("SSHD_ROOT_OFF"), "sshd:root:no")),
         row(button(t("SSHD_REMOVE"), "sshd:remove"), button(t("UI_HOME"), "nav:home")),
@@ -303,6 +320,9 @@ def help_screen(view: View) -> Any:
     )
     blocks.append(heading(t("HELP_FLOW_TITLE"), 3))
     blocks.append(bullet_list([t("HELP_FLOW_1"), t("HELP_FLOW_2"), t("HELP_FLOW_3"), t("HELP_FLOW_4")]))
+    blocks.append(heading(t("INL_HINT_TITLE"), 3))
+    blocks.append(bullet_list([t("INL_HINT_1"), t("INL_HINT_2"), t("INL_HINT_3"), t("INL_HINT_4")]))
+    blocks.append(f"<p>{muted(t('INL_STATUS_ON'))} {muted(t('INL_STATUS_OWNER'))}</p>")
     buttons = [row(button(t("UI_HOME"), "nav:home"), button(t("NAV_XRAY"), "xr:home"))]
     return screen(t("HELP_TITLE"), t("HELP_SUBTITLE"), blocks, buttons)
 
@@ -373,10 +393,9 @@ def guard_rows(view: View) -> str:
 
 def subscription_hint(path: str, url: str, lang: str = i18n.DEFAULT_LANGUAGE) -> Any:
     t = i18n.translator(lang)
-    blocks = [
-        f"<p>{t('SUB_LABEL_PATH', path=code(path))}</p>",
-        pre(url),
-        quote(muted(t("SUB_NOTE"))),
-    ]
-    buttons = [row(copy_button(t("SUB_COPY"), url)), row(button(t("UI_HOME"), "nav:home"))]
+    copy_html, long_html = fitted(t("SUB_COPY"), url, lang)
+    blocks = [f"<p>{t('SUB_LABEL_PATH', path=code(path))}</p>"]
+    blocks.append(copy_html and pre(url) or long_html)
+    blocks.append(quote(muted(t("SUB_NOTE"))))
+    buttons = [copy_html, row(button(t("UI_HOME"), "nav:home"))]
     return screen(t("SUB_TITLE"), t("SUB_SUBTITLE"), blocks, buttons)

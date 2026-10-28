@@ -7,8 +7,10 @@ import time
 
 from goygram import GoyGram
 
-from . import i18n, inline, screens, xscreens
+from . import ftscreens, i18n, inline, screens, xscreens
 from .config import Config, ConfigError
+from .freeturn import FtControl, FtError
+from .ftpanel import FtPanel
 from .guard import DEFAULT_BANTIME, BanState, GuardClient, SshState
 from .models import ModelError, valid_port
 from .panel import PanelError, XrayPanel
@@ -24,6 +26,7 @@ log = logging.getLogger("obhod.app")
 
 DRAFT_ID = 1
 CLAIM_WINDOW = 900.0
+INLINE_DUPLICATE_WINDOW = 8.0
 
 
 def public_address() -> str:
@@ -62,6 +65,7 @@ class Bot:
         self.control = control or XrayControl(shell=shell)
         self.guard = guard or GuardClient(self.control)
         self.xray = XrayPanel(self, self.control)
+        self.freeturn = FtPanel(self, FtControl(shell=shell))
         self.app: GoyGram | None = None
         self.ban: BanState | None = None
         self.sshd: SshState | None = None
@@ -73,6 +77,7 @@ class Bot:
         self.callback_limit = CALLBACK_LIMIT
         self.expensive_limit = EXPENSIVE_LIMIT
         self.inline_limit = INLINE_LIMIT
+        self.inline_seen: dict[tuple[str, str, str], float] = {}
 
     @property
     def admin_id(self) -> int:
@@ -138,6 +143,7 @@ class Bot:
         app.on_cb(fn=self.on_callback)
         app.on_cmd("start", "menu", "help", "id", "language")(self.on_command)
         app.on_inline(fn=self.on_inline)
+        app.on_update(fn=self.on_chosen)
         self.app = app
         return app
 
@@ -206,6 +212,12 @@ class Bot:
             "xr_ssh_maxretry": str(state.xray.fail2ban_ssh_maxretry),
             "xr_ignoreip": state.xray.fail2ban_ignoreip,
             "xr_ban_ip": "",
+            "ft_port": str(state.freeturn.config.listen_port),
+            "ft_wg_port": str(state.freeturn.config.wg_port),
+            "ft_wg_net": state.freeturn.config.wg_net,
+            "ft_host": state.freeturn.config.host or state.xray.sub_address,
+            "ft_key": "",
+            "ft_client": "",
         }
         if state.xray.inbounds:
             inbound = state.xray.inbounds[0]
@@ -223,14 +235,59 @@ class Bot:
         results: list[dict] = []
         allowed = who > 0 and who == self.admin_id and self.allowed(who, "inline", self.inline_limit, 60.0)
         if allowed:
-            current = self.input_values()
-            results = inline.results_for(query, src=src, current=current, lang=self.language)
-            if not results:
-                results = inline.results_for(inline.PREFIX, src=src, current=current, lang=self.language)
+            results = inline.results_for(query, src=src, current=self.input_values(), lang=self.language)
         try:
-            await evt.answer(results=results, cache_time=0)
+            await evt.answer(results=results, cache_time=0, is_personal=True)
         except Exception as exc:
             log.warning("inline answer failed: %s", exc)
+
+    async def on_chosen(self, evt: object) -> None:
+        if str(getattr(evt, "update_type", "") or "") != "chosen_inline_result":
+            return
+        raw = getattr(evt, "raw", None)
+        payload = raw.get("chosen_inline_result") if isinstance(raw, dict) else None
+        payload = payload if isinstance(payload, dict) else {}
+        who = int(((payload.get("from") or {}).get("id")) or getattr(evt, "from_id", 0) or 0)
+        if not self.admin_id or who != self.admin_id:
+            log.warning("a foreign user picked an inline result: %s", who)
+            return
+        if not self.allowed(who, "inline", self.inline_limit, 60.0):
+            return
+        rid = str(payload.get("result_id", "") or "")
+        query = str(payload.get("query", "") or "")
+        kind, token, index = inline.parse_option_id(rid)
+        if not kind:
+            kind, token, index = inline.parse_result_id(rid)
+        if not kind:
+            log.warning("an inline result id is not recognised: %s", rid[:48])
+            return
+        try:
+            value = inline.value_for(kind, token, index, query, self.language)
+        except inline.InlineError as exc:
+            log.warning("the inline value was rejected: %s", exc)
+            return
+        await self.apply_inline_value(token, kind, value, index, "chosen")
+
+    async def apply_inline_value(self, token: str, kind: str, value: str, index: int, source: str) -> None:
+        ident, ctx, _mode = inline.resolve(token)
+        if not ident:
+            log.warning("an inline token is not registered any more")
+            return
+        if self.recent_inline(ident, ctx, value):
+            log.debug("a duplicate inline value was skipped: %s", ident)
+            return
+        await self.dispatch_input(self.admin_id, ident, ctx, value)
+
+    def recent_inline(self, ident: str, ctx: str, value: str) -> bool:
+        now = time.monotonic()
+        stamp = (ident, ctx, value)
+        for key, moment in list(self.inline_seen.items()):
+            if now - moment > INLINE_DUPLICATE_WINDOW:
+                del self.inline_seen[key]
+        if stamp in self.inline_seen:
+            return True
+        self.inline_seen[stamp] = now
+        return False
 
     async def on_message(self, evt: object) -> None:
         if not await self.guard_admin(evt):
@@ -239,9 +296,8 @@ class Bot:
             await self.toast(evt, self.tr()("TOAST_RATE"), alert=True)
             return
         text = str(getattr(evt, "text", "") or "")
-        parsed = inline.parse_marker(text)
-        if parsed is not None:
-            await self.on_input(evt, *parsed)
+        if text.startswith(inline.marker_text()):
+            await self.on_marker(evt, text)
             return
         if self.busy:
             await self.toast(evt, self.tr()("TOAST_BUSY"), alert=True)
@@ -279,22 +335,40 @@ class Bot:
             return
         await self.send(chat_id, screens.home(self.view()))
 
-    async def on_input(self, evt: object, ident: str, ctx: str, value: str) -> None:
+    async def on_marker(self, evt: object, text: str) -> None:
         chat_id = int(getattr(evt, "chat_id", 0) or 0)
         msg_id = int(getattr(evt, "msg_id", 0) or 0)
+        token, kind, index, body = inline.parse_payload(text)
         await self.drop_marker(chat_id, msg_id)
-        if self.busy and ident != inline.CANCEL:
-            await self.toast(evt, self.tr()("TOAST_BUSY"), alert=True)
+        if not token:
+            return
+        if self.busy:
+            await self.send(chat_id, screens.error_screen(self.view(), self.tr()("ERR_INPUT_TITLE"), self.tr()("TOAST_BUSY")))
             return
         try:
-            if ident == inline.CANCEL:
-                await self.xray.apply_input(chat_id, ident, ctx, value)
-                return
+            value = inline.value_from_payload(token, kind, index, body, self.language)
+        except inline.InlineError as exc:
+            await self.send(chat_id, screens.error_screen(self.view(), self.tr()("ERR_INPUT_TITLE"), str(exc)))
+            return
+        await self.apply_inline_value(token, kind, value, index, "marker")
+
+    async def dispatch_input(self, chat_id: int, ident: str, ctx: str, value: str) -> None:
+        if not chat_id:
+            return
+        actor = self.admin_id
+        try:
             if ident.startswith("ssh_"):
                 await self.ssh_input(chat_id, ident, value)
+                self.audit.note(actor, "input:%s" % ident, "ok")
+                return
+            if ident.startswith("ft_"):
+                await self.freeturn.apply_input(chat_id, ident, ctx, value)
+                self.audit.note(actor, "input:%s" % ident, "ok")
                 return
             await self.xray.apply_input(chat_id, ident, ctx, value)
-        except (PanelError, ModelError, ConfigError, RpcError, ShellError) as exc:
+            self.audit.note(actor, "input:%s" % ident, "ok")
+        except (PanelError, ModelError, ConfigError, RpcError, ShellError, FtError) as exc:
+            self.audit.note(actor, "input:%s" % ident, "failed")
             message = getattr(exc, "message", str(exc))
             await self.send(chat_id, screens.error_screen(self.view(), self.tr()("ERR_INPUT_TITLE"), message))
 
@@ -343,7 +417,7 @@ class Bot:
                 return
         try:
             await self.route(chat_id, msg_id, data)
-        except (PanelError, ModelError, ConfigError, RpcError, ShellError) as exc:
+        except (PanelError, ModelError, ConfigError, RpcError, ShellError, FtError) as exc:
             message = getattr(exc, "message", str(exc))
             await self.render(chat_id, msg_id, screens.error_screen(self.view(), self.tr()("ERR_TITLE"), message))
         except Exception as exc:
@@ -370,6 +444,12 @@ class Bot:
             return
         if head == "xr":
             await self.xray.route(chat_id, msg_id, data)
+            return
+        if head == "ft":
+            await self.freeturn.route(chat_id, msg_id, data)
+            return
+        if head == "core":
+            await self.core_action(chat_id, msg_id, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else "")
             return
         await self.render(chat_id, msg_id, screens.home(self.view(notice=self.tr()("HOME_NOTICE_UNKNOWN"))))
 
@@ -408,10 +488,26 @@ class Bot:
         if page == "xray":
             await self.render(chat_id, msg_id, xscreens.home(self.xray.view()))
             return
+        if page == "freeturn":
+            await self.render(chat_id, msg_id, ftscreens.home(self.freeturn.view()))
+            return
+        if page == "core":
+            await self.render(chat_id, msg_id, ftscreens.core_screen(self.freeturn.view()))
+            return
         await self.render(chat_id, msg_id, screens.home(self.view()))
 
     async def ssh_action(self, chat_id: int, msg_id: int, action: str) -> None:
         await self.render(chat_id, msg_id, screens.ssh_settings(self.view()))
+
+    async def core_action(self, chat_id: int, msg_id: int, action: str, name: str) -> None:
+        t = self.tr()
+        if action == "set" and name in {"xray", "freeturn"}:
+            self.freeturn.set_core(name)
+            label = t("CORE_BTN_FREETURN") if name == "freeturn" else t("CORE_BTN_XRAY")
+            self.audit.note(self.admin_id, "core:set", "ok", name)
+            await self.render(chat_id, msg_id, ftscreens.core_screen(self.freeturn.view(notice=t("CORE_SWITCHED", name=label))))
+            return
+        await self.render(chat_id, msg_id, ftscreens.core_screen(self.freeturn.view()))
 
     async def ban_action(self, chat_id: int, msg_id: int, action: str) -> None:
         t = self.tr()
@@ -506,6 +602,26 @@ class Bot:
     async def harden(self, chat_id: int, port: int = 0, password: str = "", root: str = "") -> None:
         actor = self.admin_id
         detail = "port=%d password=%s root=%s" % (int(port or 0), "set" if password else "-", "set" if root else "-")
+        if password == "no":
+            try:
+                self.sshd = await self.guard.ssh_status(self.state.ssh)
+            except RpcError as exc:
+                self.audit.note(actor, "sshd:harden", "failed", detail)
+                await self.send(chat_id, screens.sshd_screen(self.view(error=exc.message)))
+                return
+            keys = self.sshd.key_list
+            if not keys and not self.sshd.keys:
+                self.audit.note(actor, "sshd:harden", "blocked", "no public key in %s" % (self.sshd.key_path or "authorized_keys"))
+                await self.send(
+                    chat_id,
+                    screens.sshd_screen(
+                        self.view(
+                            error=self.tr()("SSHD_PW_BLOCKED", user=self.sshd.key_user or "root", path=self.sshd.key_path or "~/.ssh/authorized_keys"),
+                            notice=self.tr()("SSHD_NOTICE_PW_BLOCKED"),
+                        )
+                    ),
+                )
+                return
         try:
             self.sshd = await self.guard.ssh_apply(self.state.ssh, port=port, password=password, root=root)
         except RpcError as exc:

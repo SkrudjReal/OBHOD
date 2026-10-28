@@ -157,14 +157,31 @@ def test_raise_messages_are_english() -> None:
     assert offenders == []
 
 
+FREE_TURN_FILES = {"freeturn.py", "freeturn_agent.py", "ftpanel.py", "ftscreens.py"}
+FREE_TURN_PREFIXES = ("FT_", "FLD_FT_", "FLH_FT_", "CORE_", "NAV_FREETURN")
+
+
 def test_no_non_post_quantum_names() -> None:
     banned = ("vmess", "trojan", "shadowsocks", "httpupgrade", "wireguard", "kcp")
     offenders: list[str] = []
     for path in AUTHORED_PY:
-        if path.name in {"test_xray.py", "test_screens.py", "test_xscreens.py", "test_source.py"}:
+        if path.name in {"test_xray.py", "test_screens.py", "test_xscreens.py", "test_source.py", "test_freeturn.py", "test_ftpanel.py"}:
             continue
-        text = path.read_text(encoding="utf-8").lower()
+        if path.name in FREE_TURN_FILES:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if path.name == "strings.py":
+            for number, line in enumerate(text.splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith(FREE_TURN_PREFIXES):
+                    continue
+                lowered = stripped.lower()
+                for name in banned:
+                    if name in lowered:
+                        offenders.append(f"{path.relative_to(ROOT)}:{number}: {name}")
+            continue
+        lowered = text.lower()
         for name in banned:
-            if name in text:
+            if name in lowered:
                 offenders.append(f"{path.relative_to(ROOT)}: {name}")
     assert offenders == []

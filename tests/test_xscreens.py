@@ -76,6 +76,26 @@ def test_links_screen_renders_links() -> None:
     assert "copy_text" in html
 
 
+def test_links_screen_moves_a_long_link_into_the_summary() -> None:
+    inbound = new_inbound("vless", 443, "raw", "reality")
+    inbound.make_client("owner")
+    long_link = "vless://" + "a" * 500
+    html = xscreens.links_screen(view(), inbound, "host", [("owner", long_link)]).to_html()
+    assert "<details>" in html
+    assert long_link in html
+    assert "copy_text" not in html
+
+
+def test_inbound_screen_offers_a_list_for_fixed_choices() -> None:
+    from BOT import inline
+
+    inline.configure("ab" * 32)
+    inbound = new_inbound("vless", 443, "raw", "reality")
+    html = xscreens.inbound_screen(view(), inbound).to_html()
+    assert i18n.t("BTN_LIST") in html
+    assert inline.list_query("xr_fingerprint", str(inbound.id)) in html
+
+
 def test_client_screen_fields() -> None:
     inbound = new_inbound("vless", 443, "raw", "reality")
     inbound.make_client("owner")
@@ -148,7 +168,8 @@ def test_scan_targets_and_input_screens() -> None:
     item = view()
     item.state.scan_targets = ["a:443", "b:443"]
     assert "a:443" in xscreens.scan_targets_screen(item).to_html()
-    assert "xr_port" in xscreens.input_screen(item, "xr_port", "1", "xr:in:1").to_html()
+    html = xscreens.input_screen(item, "xr_port", "1", "xr:in:1").to_html()
+    assert "switch_inline_query_current_chat" in html
     with pytest.raises(Exception):
         xscreens.input_screen(item, "nope")
 

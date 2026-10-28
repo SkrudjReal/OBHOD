@@ -7,9 +7,10 @@ import pytest
 
 from BOT import i18n, inline, screens, xscreens
 from BOT.config import ConfigError
+from BOT.guard import SshState
 from BOT.models import ModelError
 from BOT.xray import new_inbound
-from tests.fakes import FakeEvent, make_bot
+from tests.fakes import FakeEvent, FakeFtControl, make_bot
 
 
 def run(coro: object) -> None:
@@ -128,45 +129,119 @@ def test_ssh_new_port_and_pubkey_inputs(tmp_path: Path) -> None:
     assert "ssh_add_key" in bot.guard.calls
 
 
-def test_inline_lists_fields(tmp_path: Path) -> None:
+def test_inline_answers_only_the_admin(tmp_path: Path) -> None:
     bot = make_bot(tmp_path)
-    evt = FakeEvent(query="ob")
+    evt = FakeEvent(query="", from_id=7)
     run(bot.on_inline(evt))
     assert evt.results
-    evt_two = FakeEvent(query="ob xr_sub_port - 2096")
-    run(bot.on_inline(evt_two))
-    assert evt_two.results
+    assert evt.answers[0]["is_personal"] is True
+    assert evt.answers[0]["cache_time"] == 0
+    stranger = FakeEvent(query="", from_id=99)
+    run(bot.on_inline(stranger))
+    assert stranger.results == []
 
 
-def test_marker_message_is_processed(tmp_path: Path) -> None:
+def test_inline_token_round_trip_through_the_bot(tmp_path: Path) -> None:
     bot = make_bot(tmp_path)
-    marker = inline.marker("xr_sub_port", "-", "2096")
-    evt = FakeEvent(text=marker, msg_id=10)
+    query = inline.prefill("xr_sub_port") + "3331 "
+    evt = FakeEvent(query=query, from_id=7)
+    run(bot.on_inline(evt))
+    assert len(evt.results) == 1
+    chosen = FakeEvent(
+        update_type="chosen_inline_result",
+        from_id=7,
+        raw={"chosen_inline_result": {"result_id": evt.results[0]["id"], "from": {"id": 7}, "query": query}},
+    )
+    run(bot.on_chosen(chosen))
+    assert bot.state.xray.sub_port == 3331
+
+
+def test_chosen_option_applies_the_value(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    inbound = new_inbound("vless", 443, "raw", "reality")
+    bot.state.xray.add(inbound)
+    evt = FakeEvent(query=inline.list_query("xr_fingerprint", str(inbound.id)), from_id=7)
+    run(bot.on_inline(evt))
+    picked = evt.results[3]
+    chosen = FakeEvent(
+        update_type="chosen_inline_result",
+        from_id=7,
+        raw={"chosen_inline_result": {"result_id": picked["id"], "from": {"id": 7}, "query": "list"}},
+    )
+    run(bot.on_chosen(chosen))
+    assert inbound.fingerprint == inline.options("xr_fingerprint")[2]
+
+
+def test_chosen_result_of_a_stranger_is_ignored(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    inbound = new_inbound("vless", 443, "raw", "reality")
+    bot.state.xray.add(inbound)
+    evt = FakeEvent(query=inline.list_query("xr_fingerprint", str(inbound.id)), from_id=7)
+    run(bot.on_inline(evt))
+    before = inbound.fingerprint
+    chosen = FakeEvent(
+        update_type="chosen_inline_result",
+        from_id=99,
+        raw={"chosen_inline_result": {"result_id": evt.results[2]["id"], "from": {"id": 99}, "query": "list"}},
+    )
+    run(bot.on_chosen(chosen))
+    assert inbound.fingerprint == before
+
+
+def test_chosen_update_of_another_type_is_skipped(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    evt = FakeEvent(update_type="inline_query", from_id=7, raw={})
+    run(bot.on_chosen(evt))
+    assert bot.sent == []
+
+
+def test_marker_message_is_processed_and_deleted(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    token = inline.token_for("xr_sub_port")
+    marker = inline.payload_text(token, "i", -1, "2096")
+    evt = FakeEvent(text=marker, msg_id=10, from_id=7)
     run(bot.on_message(evt))
     assert bot.state.xray.sub_port == 2096
+    assert bot.app.deleted == [(1, 10)]
 
 
-def test_cancel_marker_is_routed(tmp_path: Path) -> None:
+def test_unknown_marker_is_dropped_silently(tmp_path: Path) -> None:
     bot = make_bot(tmp_path)
-    evt = FakeEvent(text=inline.cancel_marker())
+    before = bot.state.xray.sub_port
+    evt = FakeEvent(text=inline.MARKER + inline.SEPARATOR + "aaaaaaaaaaix", msg_id=11, from_id=7)
     run(bot.on_message(evt))
-    assert bot.sent
+    assert bot.app.deleted == [(1, 11)]
+    assert bot.state.xray.sub_port == before
+    assert len(bot.sent) == 1
+    assert i18n.t("INL_STALE") in bot.sent[0].to_html()
 
 
 def test_input_for_inbound_field(tmp_path: Path) -> None:
     bot = make_bot(tmp_path)
     inbound = new_inbound("vless", 443, "raw", "reality")
     bot.state.xray.add(inbound)
-    marker = inline.marker("xr_sni", str(inbound.id), "www.microsoft.com")
-    run(bot.on_message(FakeEvent(text=marker)))
+    token = inline.token_for("xr_sni", str(inbound.id))
+    marker = inline.payload_text(token, "i", -1, "www.microsoft.com")
+    run(bot.on_message(FakeEvent(text=marker, msg_id=12, from_id=7)))
     assert inbound.sni == "www.microsoft.com"
 
 
 def test_input_error_is_reported(tmp_path: Path) -> None:
     bot = make_bot(tmp_path)
-    marker = inline.marker("xr_sub_port", "-", "bad")
-    run(bot.on_message(FakeEvent(text=marker)))
+    token = inline.token_for("xr_sub_port")
+    marker = inline.payload_text(token, "i", -1, "bad")
+    run(bot.on_message(FakeEvent(text=marker, msg_id=13, from_id=7)))
     assert bot.sent
+
+
+def test_duplicate_marker_is_ignored(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    token = inline.token_for("xr_sub_port")
+    marker = inline.payload_text(token, "i", -1, "2096")
+    run(bot.on_message(FakeEvent(text=marker, msg_id=14, from_id=7)))
+    bot.state.xray.sub_port = 0
+    run(bot.on_message(FakeEvent(text=marker, msg_id=15, from_id=7)))
+    assert bot.state.xray.sub_port == 0
 
 
 def test_busy_flag_blocks_callbacks(tmp_path: Path) -> None:
@@ -299,3 +374,67 @@ def test_toast_and_notice_are_localized(tmp_path: Path) -> None:
     evt_two = FakeEvent(text="what")
     run(bot.on_message(evt_two))
     assert i18n.t("HOME_NOTICE_PICK", "ru") in bot.sent[-1].to_html()
+
+
+def test_sshd_password_switch_is_blocked_without_a_key(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+
+    async def empty_status(cfg: object) -> SshState:
+        bot.guard.calls.append("ssh_status")
+        return SshState(
+            ports=[22],
+            permit_root_login="prohibit-password",
+            service="active",
+            keys=0,
+            key_user="root",
+            key_path="/root/.ssh/authorized_keys",
+            key_list=[],
+        )
+
+    bot.guard.ssh_status = empty_status
+    sent: list[object] = []
+
+    async def grab(chat_id: int, rich: object) -> None:
+        sent.append(rich)
+
+    bot.send = grab
+    run(bot.sshd_action(1, 0, "auth", "no"))
+    assert "ssh_apply" not in bot.guard.calls
+    assert sent
+    blob = str(sent[-1])
+    assert "/root/.ssh/authorized_keys" in blob
+    assert "SSHD_PW_BLOCKED" not in blob
+
+
+def test_sshd_password_switch_passes_when_a_key_exists(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    run(bot.sshd_action(1, 0, "auth", "no"))
+    assert "ssh_apply" in bot.guard.calls
+
+
+def test_freeturm_is_reachable_from_the_router(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    bot.freeturn.control = FakeFtControl()
+    run(bot.route(1, 0, "ft:home"))
+    assert "FreeTurn" in str(bot.rendered[-1])
+    run(bot.route(1, 0, "ft:check"))
+    assert bot.state.freeturn.installed is True
+
+
+def test_core_switch_between_the_two_engines(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    run(bot.route(1, 0, "core:show"))
+    assert "core" in str(bot.rendered[-1]).lower()
+    run(bot.route(1, 0, "core:set:freeturn"))
+    assert bot.state.core == "freeturn"
+    run(bot.route(1, 0, "core:set:xray"))
+    assert bot.state.core == "xray"
+    run(bot.route(1, 0, "core:set:other"))
+    assert bot.state.core == "xray"
+
+
+def test_freeturm_inline_inputs_are_routed(tmp_path: Path) -> None:
+    bot = make_bot(tmp_path)
+    bot.freeturn.control = FakeFtControl()
+    run(bot.dispatch_input(7, "ft_port", "-", "56140"))
+    assert bot.state.freeturn.config.listen_port == 56140

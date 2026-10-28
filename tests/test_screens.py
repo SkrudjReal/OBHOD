@@ -40,8 +40,7 @@ def test_ssh_settings_shows_a_local_shell(tmp_path: Path) -> None:
     assert i18n.t("SSH_LOCAL_MODE") in html
     assert i18n.t("SSH_NO_PASSWORD") in html
     assert "ssh_host" not in html
-    assert "ssh_new_port" in html
-    assert "ssh_pubkey" in html
+    assert "switch_inline_query_current_chat" in html
     assert count_buttons(html) <= MAX_BUTTONS
 
 
@@ -115,6 +114,20 @@ def test_subscription_hint_contains_path(tmp_path: Path) -> None:
     html = screens.subscription_hint("/a/b", "http://host:2096/a/b").to_html()
     assert "/a/b" in html
     assert "secrets" in html
+
+
+def test_subscription_hint_puts_a_long_url_into_the_summary() -> None:
+    url = "http://host:2096/" + "a" * 400
+    html = screens.subscription_hint("/a/b", url).to_html()
+    assert "<details>" in html
+    assert i18n.t("UI_LONG_TITLE") in html
+    assert "copy_text" not in html
+
+
+def test_subscription_hint_keeps_a_short_url_on_a_button() -> None:
+    html = screens.subscription_hint("/a/b", "http://host:2096/a/b").to_html()
+    assert "copy_text" in html
+    assert "<details>" not in html
 
 
 def render_all(lang: str = i18n.DEFAULT_LANGUAGE) -> list[tuple[str, object]]:

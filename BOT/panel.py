@@ -9,7 +9,7 @@ from . import i18n, inline, screens, xscreens
 from .inline import InlineError
 from .models import ModelError
 from .scan import CONCURRENCY, ScanResult, best_candidate, parse_candidates, scan_targets
-from .ui import button, code, copy_button, muted, pre, quote, row, screen
+from .ui import button, code, copy_row, muted, pre, quote, row, screen
 from .xray import (
     DEFAULT_IGNOREIP,
     FINGERPRINTS,
@@ -47,7 +47,6 @@ CANDIDATE_LIMIT = 512
 FIELDS = frozenset(inline.FIELDS)
 GLOBAL_FIELDS = frozenset(
     {
-        inline.CANCEL,
         "xr_scan_targets",
         "xr_scan_manual",
         "xr_log_level",
@@ -385,7 +384,7 @@ class XrayPanel:
             quote(muted(t("XR_SUBS_NOTE", length=SUB_SEGMENT_LEN))),
         ]
         buttons = [
-            row(copy_button(t("SUB_COPY"), url)),
+            copy_row(t("SUB_COPY"), url) or "",
             row(button(t("XR_CLIENT_NEW_PATH"), f"xr:subrot:{ident}:{email}"), button(t("XR_CLIENT_SUB"), f"xr:cl:{ident}:{email}")),
             xscreens.back_row(self.bot.state.language, "xr:home"),
         ]
@@ -896,9 +895,6 @@ class XrayPanel:
         raise PanelError(f"the field {ident} is not supported")
 
     async def apply_input(self, chat_id: int, ident: str, ctx: str, value: str) -> None:
-        if ident == inline.CANCEL:
-            await self.send(chat_id, xscreens.home(self.view(notice=self.tr()("NOTICE_INPUT_CANCELLED"))))
-            return
         try:
             notice = self.set_field(ident, ctx, value)
         except (PanelError, XrayError, InlineError, ModelError, ValueError) as exc:

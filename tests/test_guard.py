@@ -255,7 +255,8 @@ def test_ssh_agent_refuses_to_disable_the_password_without_a_key(tmp_path: Path,
     module, _keys, dropin, _add = prepared_agent(tmp_path, monkeypatch)
     with pytest.raises(module.ScriptError) as info:
         module.apply({"password": "no"})
-    assert info.value.code == "bad_arg"
+    assert info.value.code == "no_keys"
+    assert "no public key" in info.value.message
     assert not dropin.exists()
 
 

@@ -5,6 +5,7 @@ import re
 import pytest
 from goygram.rich import Rich
 
+from BOT import i18n
 from BOT.ui import (
     MAX_BUTTONS,
     big,
@@ -14,12 +15,16 @@ from BOT.ui import (
     chip,
     code,
     copy_button,
+    copy_row,
     count_buttons,
     details,
+    fitted,
     divider,
     esc,
     heading,
     muted,
+    input_row,
+    long_block,
     numbered,
     pre,
     quote,
@@ -126,3 +131,55 @@ def test_status_line_states() -> None:
     assert "not installed" in status_line(True, False, False)
     assert "running" in status_line(True, True, True)
     assert "stopped" in status_line(True, False, True)
+
+
+def test_copy_row_respects_the_platform_limit() -> None:
+    from BOT.ui import COPY_TEXT_LIMIT, long_payload
+
+    assert "copy_text" in copy_row("copy", "x" * COPY_TEXT_LIMIT)
+    assert copy_row("copy", "x" * (COPY_TEXT_LIMIT + 1)) == ""
+    assert copy_row("copy", "") == ""
+    assert "freeturn://" in long_payload("freeturn://" + "a" * 900)
+    assert long_payload("") == ""
+
+
+def test_long_block_is_a_collapsed_summary() -> None:
+    html = long_block("whole config", "A" * 400)
+    assert html.startswith("<details>")
+    assert "<summary>whole config</summary>" in html
+    assert "A" * 400 in html
+    assert long_block("t", "") == ""
+
+
+def test_fitted_keeps_short_text_on_a_button() -> None:
+    button_html, block_html = fitted("copy", "https://example.com/sub", "en")
+    assert "copy_text" in button_html
+    assert block_html == ""
+
+
+def test_fitted_moves_long_text_into_the_summary() -> None:
+    long_url = "vless://" + "a" * 900
+    button_html, block_html = fitted("copy", long_url, "en")
+    assert button_html == ""
+    assert "<details>" in block_html
+    assert long_url in block_html
+    assert i18n.t("UI_LONG_HINT", "en") in block_html
+
+
+def test_input_row_prefills_only_a_token() -> None:
+    from BOT import inline
+
+    inline.configure("ab" * 32)
+    html = input_row("dest", "xr_sni", "1", "en")
+    assert html.count("switch_inline_query_current_chat") == 1
+    assert "xr_sni" not in html
+    assert inline.token_for("xr_sni", "1") in html
+
+
+def test_input_row_adds_the_list_button_for_fixed_choices() -> None:
+    from BOT import inline
+
+    inline.configure("ab" * 32)
+    manual = input_row("fingerprint", "xr_fingerprint", "1", "en")
+    assert manual.count("switch_inline_query_current_chat") == 2
+    assert i18n.t("BTN_LIST", "en") in manual
